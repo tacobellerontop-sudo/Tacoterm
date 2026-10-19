@@ -1,0 +1,34 @@
+[package]
+name = "tacoterm"
+version = "0.1.0"
+edition = "2021"
+description = "A GPU-accelerated terminal emulator for Windows, written in Rust on ConPTY"
+license = "MIT"
+
+[[bin]]
+name = "tacoterm"
+path = "src/main.rs"
+
+[dependencies]
+# Windows API bindings: ConPTY, pipes, process creation
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+# VT / ANSI escape sequence parser
+vte = "0.14"
+# Windowing + keyboard input
+winit = "0.30"
+# GPU rendering (stubbed in src/renderer.rs until the grid is wired up)
+wgpu = "24"
+# Text shaping + font fallback
+cosmic-text = "0.12"
+# Config file
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+# Small, fast binary like the rest of the fleet
+lto = true
+codegen-units = 1
