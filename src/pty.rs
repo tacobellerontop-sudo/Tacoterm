@@ -9,20 +9,22 @@
 
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows::Win32::System::Console::{
-    ClosePseudoConsole, CreatePipe, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
+    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
+use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, TerminateProcess, EXTENDED_STARTUPINFO_PRESENT,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-    STARTUPINFOEXW, STARTUPINFOW,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, EXTENDED_STARTUPINFO_PRESENT, INFINITE, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 pub struct Pty {
@@ -55,26 +57,40 @@ impl Pty {
                 X: cols as i16,
                 Y: rows as i16,
             };
-            let mut hpc = HPCON::default();
-            if let Err(e) = CreatePseudoConsole(size, pty_in_read, pty_out_write, 0, &mut hpc) {
-                let _ = CloseHandle(pty_in_read);
-                let _ = CloseHandle(pty_out_write);
-                let _ = CloseHandle(our_in_write);
-                let _ = CloseHandle(our_out_read);
-                return Err(io::Error::from(e));
-            }
-            // The console owns its ends now; close our copies.
+            let created = CreatePseudoConsole(size, pty_in_read, pty_out_write, 0);
+            // The console holds its own references to its ends; close ours.
             let _ = CloseHandle(pty_in_read);
             let _ = CloseHandle(pty_out_write);
+            let hpc = match created {
+                Ok(hpc) => hpc,
+                Err(e) => {
+                    let _ = CloseHandle(our_in_write);
+                    let _ = CloseHandle(our_out_read);
+                    return Err(io::Error::from(e));
+                }
+            };
+            // From here on, dropping `pty` cleans everything up.
+            let mut pty = Pty {
+                hpc,
+                input: File::from_raw_handle(our_in_write.0),
+                output: File::from_raw_handle(our_out_read.0),
+                child: HANDLE::default(),
+            };
 
             // Attribute list carrying the pseudo-console handle into the child.
             let mut needed: usize = 0;
-            let _ = InitializeProcThreadAttributeList(None, 1, 0, &mut needed);
-            let mut attr_mem = vec![0u8; needed];
+            let _ = InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut()),
+                1,
+                0,
+                &mut needed,
+            );
+            // usize-aligned backing store for the opaque list.
+            let mut attr_mem = vec![0usize; needed.div_ceil(std::mem::size_of::<usize>())];
             let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_mem.as_mut_ptr().cast());
-            InitializeProcThreadAttributeList(Some(attr_list), 1, 0, &mut needed)
+            InitializeProcThreadAttributeList(attr_list, 1, 0, &mut needed)
                 .map_err(io::Error::from)?;
-            UpdateProcThreadAttribute(
+            let updated = UpdateProcThreadAttribute(
                 attr_list,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
@@ -82,20 +98,26 @@ impl Pty {
                 std::mem::size_of::<HPCON>(),
                 None,
                 None,
-            )
-            .map_err(io::Error::from)?;
+            );
+            if let Err(e) = updated {
+                DeleteProcThreadAttributeList(attr_list);
+                return Err(io::Error::from(e));
+            }
 
             let mut si_ex = STARTUPINFOEXW::default();
             si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
             si_ex.lpAttributeList = attr_list;
+            // Null std handles: without this, a child of a process that has
+            // its own console (debug builds) can attach to that console
+            // instead of the pseudo-console.
+            si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
 
             // CreateProcessW wants a *mutable* UTF-16 buffer.
-            let mut cmd: Vec<u16> =
-                OsStr::new(shell).encode_wide().chain([0]).collect();
+            let mut cmd: Vec<u16> = OsStr::new(shell).encode_wide().chain([0]).collect();
             let mut pi = PROCESS_INFORMATION::default();
             let spawned = CreateProcessW(
                 None,
-                Some(PWSTR(cmd.as_mut_ptr())),
+                PWSTR(cmd.as_mut_ptr()),
                 None,
                 None,
                 false,
@@ -105,28 +127,16 @@ impl Pty {
                 std::ptr::addr_of_mut!(si_ex).cast::<STARTUPINFOW>(),
                 &mut pi,
             );
-
             DeleteProcThreadAttributeList(attr_list);
+            spawned.map_err(io::Error::from)?;
 
-            if let Err(e) = spawned {
-                ClosePseudoConsole(hpc);
-                let _ = CloseHandle(our_in_write);
-                let _ = CloseHandle(our_out_read);
-                return Err(io::Error::from(e));
-            }
             let _ = CloseHandle(pi.hThread);
-
-            Ok(Pty {
-                hpc,
-                input: File::from_raw_handle(our_in_write.0),
-                output: File::from_raw_handle(our_out_read.0),
-                child: pi.hProcess,
-            })
+            pty.child = pi.hProcess;
+            Ok(pty)
         }
     }
 
-    /// Clone the read end for the drain thread. The original stays here for
-    /// nothing — reads only happen on the clone.
+    /// Clone the read end for the drain thread; reads only happen there.
     pub fn try_clone_reader(&self) -> io::Result<File> {
         self.output.try_clone()
     }
@@ -150,16 +160,43 @@ impl Pty {
         }
     }
 
+    /// A handle the caller can block on (on another thread) until the shell
+    /// exits. ConPTY keeps the output pipe open after the child dies, so a
+    /// reader never sees EOF; this is how the app notices.
+    pub fn exit_waiter(&self) -> io::Result<ExitWaiter> {
+        let mut dup = HANDLE::default();
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.child,
+                GetCurrentProcess(),
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .map_err(io::Error::from)?;
+        }
+        Ok(ExitWaiter(dup.0 as isize))
+    }
+
     /// Force-kill the child (used on quit; dropping also closes the console).
     pub fn terminate(&mut self) -> io::Result<()> {
         unsafe { TerminateProcess(self.child, 1).map_err(io::Error::from) }
     }
+}
 
-    /// Drain whatever is available without blocking. Returns bytes read.
-    /// (The drain thread mostly does blocking reads; this is for shutdown.)
-    #[allow(dead_code)]
-    pub fn read_available(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.output.read(buf)
+/// An owned process handle that can move to another thread.
+pub struct ExitWaiter(isize);
+
+impl ExitWaiter {
+    /// Block until the process exits.
+    pub fn wait(self) {
+        let h = HANDLE(self.0 as *mut core::ffi::c_void);
+        unsafe {
+            WaitForSingleObject(h, INFINITE);
+            let _ = CloseHandle(h);
+        }
     }
 }
 
@@ -167,7 +204,9 @@ impl Drop for Pty {
     fn drop(&mut self) {
         unsafe {
             ClosePseudoConsole(self.hpc);
-            let _ = CloseHandle(self.child);
+            if !self.child.is_invalid() {
+                let _ = CloseHandle(self.child);
+            }
         }
     }
 }
