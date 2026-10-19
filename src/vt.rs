@@ -5,14 +5,33 @@
 //! insert/delete, scroll regions, the alternate screen, the common private
 //! modes (including mouse and focus reporting), cursor shape, device status
 //! and attribute reports, window titles, the bell, OSC 52 clipboard writes,
-//! the working directory (OSC 7 / OSC 9;9), and SGR colors (16 ANSI + 256 +
-//! truecolor). Everything else is ignored rather than misrendered — extend
-//! as needed.
+//! the working directory (OSC 7 / OSC 9;9), SGR colors (16 ANSI + 256 +
+//! truecolor) and pictures (kitty graphics, sixel, iTerm2 inline images; see
+//! [`crate::graphics`]). Everything else is ignored rather than misrendered —
+//! extend as needed.
 
 use vte::{Params, Perform};
 
 use crate::config::CursorStyle;
+use crate::graphics::{self, Sixel};
 use crate::grid::{Attr, Color, Grid, MouseMode, Pen};
+
+/// The longest APC string kept (a kitty graphics chunk is at most 4 KiB;
+/// this leaves room for programs that don't chunk).
+const MAX_APC: usize = 64 << 20;
+
+/// Where the APC scanner is: `vte` drops APC strings, so kitty graphics
+/// commands are picked out before the bytes reach it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Apc {
+    Normal,
+    /// Saw ESC at the end of a chunk.
+    Esc,
+    /// Inside `ESC _ … ESC \`.
+    In,
+    /// Inside, and just saw ESC.
+    InEsc,
+}
 
 pub struct Vt {
     parser: vte::Parser,
@@ -29,6 +48,10 @@ pub struct Vt {
     /// The shell's working directory as last reported (OSC 7 / OSC 9;9),
     /// in Windows form when it names a drive (`C:\Users\me`).
     pub cwd: Option<String>,
+    apc_state: Apc,
+    apc: Vec<u8>,
+    /// A sixel picture arriving in a DCS string.
+    sixel: Option<Sixel>,
 }
 
 impl Default for Vt {
@@ -46,12 +69,82 @@ impl Vt {
             bell: false,
             clipboard: None,
             cwd: None,
+            apc_state: Apc::Normal,
+            apc: Vec::new(),
+            sixel: None,
         }
     }
 
     /// Parse raw PTY output. UTF-8 sequences split across calls are fine:
     /// the parser keeps its state between chunks.
     pub fn advance(&mut self, grid: &mut Grid, bytes: &[u8]) {
+        // Pass everything to vte except APC strings, which go to `apc`.
+        let mut run = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match self.apc_state {
+                Apc::Normal if b == 0x1b => {
+                    if i + 1 == bytes.len() {
+                        self.feed(grid, &bytes[run..i]);
+                        self.apc_state = Apc::Esc;
+                        run = i + 1;
+                    } else if bytes[i + 1] == b'_' {
+                        self.feed(grid, &bytes[run..i]);
+                        self.apc_state = Apc::In;
+                        self.apc.clear();
+                        i += 1;
+                        run = i + 1;
+                    }
+                }
+                Apc::Normal => {}
+                Apc::Esc => {
+                    if b == b'_' {
+                        self.apc_state = Apc::In;
+                        self.apc.clear();
+                        run = i + 1;
+                    } else {
+                        // The ESC wasn't ours after all.
+                        self.apc_state = Apc::Normal;
+                        self.feed(grid, b"\x1b");
+                        run = i;
+                        continue;
+                    }
+                }
+                Apc::In if b == 0x1b => self.apc_state = Apc::InEsc,
+                Apc::In => {
+                    if self.apc.len() < MAX_APC {
+                        self.apc.push(b);
+                    }
+                }
+                Apc::InEsc => {
+                    if b == b'\\' {
+                        self.apc_state = Apc::Normal;
+                        let apc = std::mem::take(&mut self.apc);
+                        self.apc_done(grid, &apc);
+                        run = i + 1;
+                    } else {
+                        // ESC inside an APC ends it badly: drop it and let
+                        // this ESC start whatever comes next.
+                        self.apc_state = Apc::Normal;
+                        self.apc.clear();
+                        self.feed(grid, b"\x1b");
+                        run = i;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if self.apc_state == Apc::Normal {
+            self.feed(grid, &bytes[run..]);
+        }
+    }
+
+    fn feed(&mut self, grid: &mut Grid, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         let mut performer = Performer {
             grid,
             responses: &mut self.responses,
@@ -59,8 +152,17 @@ impl Vt {
             bell: &mut self.bell,
             clipboard: &mut self.clipboard,
             cwd: &mut self.cwd,
+            sixel: &mut self.sixel,
         };
         self.parser.advance(&mut performer, bytes);
+    }
+
+    fn apc_done(&mut self, grid: &mut Grid, apc: &[u8]) {
+        if let Some(body) = apc.strip_prefix(b"G") {
+            if let Some(reply) = graphics::kitty(grid, body) {
+                self.responses.extend_from_slice(&reply);
+            }
+        }
     }
 }
 
@@ -71,6 +173,7 @@ struct Performer<'a> {
     bell: &'a mut bool,
     clipboard: &'a mut Option<String>,
     cwd: &'a mut Option<String>,
+    sixel: &'a mut Option<Sixel>,
 }
 
 /// params[i], or `default` when missing or 0 (VT counts treat 0 as 1).
@@ -106,9 +209,24 @@ impl Perform for Performer<'_> {
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
-    fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+    fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        // Sixel: DCS P1 ; P2 ; P3 q.
+        if action == 'q' && intermediates.is_empty() {
+            *self.sixel = Some(Sixel::new());
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if let Some(sixel) = self.sixel {
+            sixel.put(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if let Some(image) = self.sixel.take().and_then(Sixel::finish) {
+            graphics::place_sixel(self.grid, image);
+        }
+    }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         // TODO: OSC 8 (links).
@@ -141,6 +259,11 @@ impl Perform for Performer<'_> {
             }
             // Clipboard write: `52;<selection>;<base64>`, any selection. A
             // `?` asks to read the clipboard, which we never answer.
+            // iTerm2 inline image: `1337;File=args:base64`.
+            b"1337" if rest.first().is_some_and(|r| r.starts_with(b"File=")) => {
+                let joined: Vec<u8> = rest.join(&b';');
+                graphics::iterm_file(self.grid, &joined[5..]);
+            }
             b"52" if rest.len() >= 2 && rest[1] != b"?" => {
                 if let Some(text) = base64_decode(rest[1]).and_then(|b| String::from_utf8(b).ok()) {
                     *self.clipboard = Some(text);
@@ -178,6 +301,16 @@ impl Perform for Performer<'_> {
             // Secondary device attributes: VT100-class, version 10, no ROM.
             ('c', b">") => {
                 self.responses.extend_from_slice(b"\x1b[>0;10;1c");
+                return;
+            }
+            // XTSMGRAPHICS: sixel color registers (1) and largest size (2).
+            ('S', b"?") => {
+                let reply = match (param(params, 0, 0), param(params, 1, 0)) {
+                    (1, 1 | 4) => "\x1b[?1;0;1024S".to_string(),
+                    (2, 1 | 4) => "\x1b[?2;0;10000;10000S".to_string(),
+                    (item, _) => format!("\x1b[?{item};1;0S"),
+                };
+                self.responses.extend_from_slice(reply.as_bytes());
                 return;
             }
             // DECRQM for a private mode: 1 set, 2 reset, 0 not recognized.
@@ -253,9 +386,22 @@ impl Perform for Performer<'_> {
                 }
                 _ => {}
             },
-            // Primary device attributes: "VT100 with advanced video".
+            // Primary device attributes: VT220 with sixel graphics (4) and
+            // ANSI color (22).
             ('c', false) if intermediates.is_empty() => {
-                self.responses.extend_from_slice(b"\x1b[?1;2c")
+                self.responses.extend_from_slice(b"\x1b[?62;4;22c")
+            }
+            // XTWINOPS size reports, which picture tools use to size
+            // their output: text area in pixels, a cell, text area in cells.
+            ('t', false) => {
+                let (cw, ch) = g.cell_pixels;
+                let reply = match param(params, 0, 0) {
+                    14 => format!("\x1b[4;{};{}t", g.rows as u32 * ch, g.cols as u32 * cw),
+                    16 => format!("\x1b[6;{ch};{cw}t"),
+                    18 => format!("\x1b[8;{};{}t", g.rows, g.cols),
+                    _ => String::new(),
+                };
+                self.responses.extend_from_slice(reply.as_bytes());
             }
             _ => {}
         }
@@ -378,7 +524,7 @@ fn percent_decode(s: &str) -> String {
 
 /// Decode standard (RFC 4648) base64, padding optional. `None` on anything
 /// outside the alphabet or a length no encoder produces.
-fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
     let value = |c: u8| -> Option<u32> {
         let v = match c {
             b'A'..=b'Z' => c - b'A',
@@ -631,6 +777,32 @@ mod tests {
     }
 
     #[test]
+    fn pictures_from_apc_dcs_and_osc() {
+        let mut g = Grid::new(20, 5, 100);
+        g.cell_pixels = (8, 16);
+        let mut vt = Vt::new();
+        // A 1×1 red RGBA picture over kitty, split mid-introducer and
+        // mid-terminator, with text either side.
+        vt.advance(&mut g, b"ab\x1b");
+        vt.advance(&mut g, b"_Ga=T,f=32,s=1,v=1,i=3;/wAA/w==\x1b");
+        vt.advance(&mut g, b"\\cd");
+        assert_eq!(vt.responses, b"\x1b_Gi=3;OK\x1b\\");
+        assert_eq!(g.visible_images().len(), 1);
+        assert_eq!(g.cell(0, 0).c, 'a');
+        assert_eq!(g.cell(3, 0).c, 'c', "the cursor moved past the picture");
+        // Sixel: one red column 6 pixels tall.
+        feed(&mut g, &mut vt, "\r\n\x1bPq#1;2;100;0;0#1~\x1b\\");
+        assert_eq!(g.visible_images().len(), 2);
+        // Cell size report.
+        vt.responses.clear();
+        feed(&mut g, &mut vt, "\x1b[16t");
+        assert_eq!(vt.responses, b"\x1b[6;16;8t");
+        // An ESC that isn't an APC still works.
+        feed(&mut g, &mut vt, "\x1b[2J");
+        assert!(g.visible_images().is_empty());
+    }
+
+    #[test]
     fn attribute_and_version_queries() {
         let mut g = Grid::new(10, 2, 0);
         let mut vt = Vt::new();
@@ -641,7 +813,7 @@ mod tests {
         assert_eq!(vt.responses, b"\x1bP>|tacoterm\x1b\\");
         vt.responses.clear();
         feed(&mut g, &mut vt, "\x1b[c");
-        assert_eq!(vt.responses, b"\x1b[?1;2c");
+        assert_eq!(vt.responses, b"\x1b[?62;4;22c");
         vt.responses.clear();
         feed(
             &mut g,

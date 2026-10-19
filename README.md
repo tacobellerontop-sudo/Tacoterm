@@ -32,6 +32,10 @@ Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on t
   apps can copy to the clipboard (OSC 52)
 - Text rewraps when the window is resized
 - Box-drawing and block characters drawn to tile without gaps
+- **Pictures**: the kitty graphics protocol (PNG, raw RGB/RGBA, zlib,
+  chunked, files, placements and deletes), sixel and iTerm2 inline images
+  (PNG, JPEG, GIF, BMP, WebP). They scroll with the text. Needs the bundled
+  console (see below)
 - VT parsing for what ConPTY and full-screen apps emit: cursor movement,
   erase, insert/delete, scroll regions, alternate screen, SGR (16 / 256 /
   truecolor), titles, status reports, bracketed paste, focus events
@@ -42,8 +46,16 @@ Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on t
 ## Build (Windows)
 
 ```
-cargo run --release
+cargo build --release
+.\scripts\get-conpty.ps1
+target\release\tacoterm.exe
 ```
+
+`get-conpty.ps1` puts Windows Terminal's console (`conpty.dll` and
+`OpenConsole.exe`, from Microsoft's ConPTY NuGet package) next to
+`tacoterm.exe`. tacoterm uses it when it's there; the console built into
+Windows drops picture sequences on the way, so without it everything but
+pictures still works. The CI build bundles it.
 
 The window and ConPTY are Windows-only. The terminal core (grid, VT
 parser, renderer, config, key mapping) is a portable library, so
@@ -51,7 +63,8 @@ parser, renderer, config, key mapping) is a portable library, so
 checks its pixels (it skips when no GPU adapter, not even a software one,
 is available). `TACOTERM_SNAPSHOT=frame.png cargo test --test render` saves
 that frame (`TACOTERM_SNAPSHOT_TABS` saves the tabs-and-splits one,
-`TACOTERM_SNAPSHOT_SETTINGS` the settings page).
+`TACOTERM_SNAPSHOT_SETTINGS` the settings page,
+`TACOTERM_SNAPSHOT_IMAGES` the pictures).
 
 ## Settings
 
@@ -117,6 +130,7 @@ The file tacoterm writes on first run lists every key and binding.
 | `src/input.rs` | Key events → VT bytes; keybinding matching |
 | `src/mouse.rs` | Mouse reporting encodings |
 | `src/layout.rs` | Split-pane tree |
+| `src/graphics.rs` | Pictures: kitty graphics, sixel, iTerm2 images |
 | `src/boxdraw.rs` | Pixel-exact box-drawing and block glyphs |
 | `src/renderer.rs` | wgpu renderer: panes, tab strip, find box, glyph atlas |
 | `src/config.rs` | TOML settings, written on first run |

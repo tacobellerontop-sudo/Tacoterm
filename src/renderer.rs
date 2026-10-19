@@ -21,6 +21,7 @@ use winit::window::Window;
 
 use crate::boxdraw;
 use crate::config::{Config, CursorStyle, Rgb, Theme};
+use crate::graphics::Image;
 use crate::grid::{Attr, Color, Grid, Match, Point};
 pub use crate::layout::Rect;
 
@@ -284,9 +285,29 @@ fn rect(r: Rect, color: [f32; 4]) -> Instance {
 #[derive(Default)]
 struct Layers {
     backgrounds: Vec<Instance>,
+    /// Pictures, drawn over the backgrounds and under the text.
+    images: Vec<ImageDraw>,
     glyphs: Vec<Instance>,
     decorations: Vec<Instance>,
     overlays: Vec<Instance>,
+}
+
+/// One picture to draw: its quad (uv in image pixels) and the pane it is
+/// clipped to.
+struct ImageDraw {
+    image: Arc<Image>,
+    quad: Instance,
+    clip: Rect,
+}
+
+/// A picture uploaded to the GPU.
+struct GpuImage {
+    bind_group: wgpu::BindGroup,
+    /// Screen size and the texture's size, for the shader.
+    uniforms: wgpu::Buffer,
+    size: (u32, u32),
+    /// The frame it was last drawn in.
+    used: u64,
 }
 
 const SHADER: &str = r#"
@@ -605,6 +626,10 @@ pub struct Renderer {
     pub maximized: bool,
     /// The strip item under the mouse, highlighted.
     pub hover: Option<TabHit>,
+    bind_layout: wgpu::BindGroupLayout,
+    image_sampler: wgpu::Sampler,
+    images: HashMap<u64, GpuImage>,
+    frame_count: u64,
 }
 
 impl Renderer {
@@ -846,6 +871,14 @@ impl Renderer {
                 },
             ],
         });
+        // Pictures shrunk to their cells are smoothed; enlarged ones keep
+        // their pixels sharp (icons, pixel art).
+        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("image sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tacoterm"),
             bind_group_layouts: &[Some(&layout)],
@@ -920,6 +953,10 @@ impl Renderer {
             window_buttons: false,
             maximized: false,
             hover: None,
+            bind_layout: layout,
+            image_sampler,
+            images: HashMap::new(),
+            frame_count: 0,
         }
     }
 
@@ -1327,7 +1364,12 @@ impl Renderer {
     /// Build this frame's quads. Within each layer nothing paints over a
     /// neighbor's glyph: backgrounds, then glyphs, then decorations, then
     /// overlays (dimming, search box, bell flash).
-    fn build_instances(&mut self, frame: &Frame) -> Result<Vec<Instance>, AtlasFull> {
+    /// The frame's quads in draw order, how many of them are backgrounds
+    /// (pictures go between those and the rest), and the pictures.
+    fn build_instances(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<(Vec<Instance>, usize, Vec<ImageDraw>), AtlasFull> {
         let mut layers = Layers::default();
         if let Some(page) = &frame.settings {
             self.build_settings(&mut layers, page, frame.cursor_on)?;
@@ -1356,10 +1398,11 @@ impl Renderer {
             layers.overlays.push(rect(self.full_rect(), flash));
         }
         let mut out = layers.backgrounds;
+        let backgrounds = out.len();
         out.append(&mut layers.glyphs);
         out.append(&mut layers.decorations);
         out.append(&mut layers.overlays);
-        Ok(out)
+        Ok((out, backgrounds, layers.images))
     }
 
     fn build_pane(
@@ -1396,6 +1439,37 @@ impl Renderer {
             .collect();
         let match_bg = mix(self.colors.background, self.colors.palette[3], 0.45);
         let current_bg = self.colors.palette[11];
+
+        for (p, y) in grid.visible_images() {
+            let [sx, sy, sw, sh] = p.src;
+            let (dw, dh) = if p.fill {
+                (p.cols as f32 * cw, p.rows as f32 * ch)
+            } else if let Some((w, h)) = p.draw_size {
+                (w as f32, h as f32)
+            } else {
+                (sw as f32, sh as f32)
+            };
+            layers.images.push(ImageDraw {
+                image: p.image.clone(),
+                quad: Instance {
+                    pos: [
+                        ox + p.col as f32 * cw + p.offset.0 as f32,
+                        oy + y as f32 * ch + p.offset.1 as f32,
+                    ],
+                    size: [dw, dh],
+                    uv_pos: [sx as f32, sy as f32],
+                    uv_size: [sw as f32, sh as f32],
+                    color: [1.0; 4],
+                    kind: 2,
+                },
+                clip: Rect {
+                    x: ox,
+                    y: oy,
+                    w: grid.cols as f32 * cw,
+                    h: grid.rows as f32 * ch,
+                },
+            });
+        }
 
         for y in 0..grid.rows {
             let row = grid.visible_row(y);
@@ -2274,7 +2348,7 @@ impl Renderer {
     /// Draw a frame. Returns false when it was skipped (surface lost or
     /// outdated); the caller should request another redraw.
     pub fn render(&mut self, frame: &Frame) -> bool {
-        let instances = match self.build_instances(frame) {
+        let (mut instances, backgrounds, images) = match self.build_instances(frame) {
             Ok(i) => i,
             Err(AtlasFull) => {
                 // Start the atlas over with only this frame's glyphs.
@@ -2314,6 +2388,17 @@ impl Renderer {
             (None, Target::Window { .. }) => unreachable!(),
         };
 
+        // Pictures' quads go after everything else in the buffer; each is
+        // drawn on its own with its texture bound.
+        self.frame_count += 1;
+        let main = instances.len();
+        let mut drawn = Vec::new();
+        for d in &images {
+            if self.upload_image(&d.image) {
+                drawn.push((d.image.uid, d.clip));
+                instances.push(d.quad);
+            }
+        }
         if instances.len() > self.instance_capacity {
             self.instance_capacity = instances.len().next_power_of_two();
             self.instances = Self::instance_buffer(&self.device, self.instance_capacity);
@@ -2369,14 +2454,152 @@ impl Renderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instances.slice(..));
-                pass.draw(0..4, 0..instances.len() as u32);
+                pass.draw(0..4, 0..backgrounds as u32);
+                for (k, (uid, clip)) in drawn.iter().enumerate() {
+                    let Some(gpu) = self.images.get(uid) else {
+                        continue;
+                    };
+                    let Some((x, y, w, h)) = self.scissor(*clip) else {
+                        continue;
+                    };
+                    pass.set_scissor_rect(x, y, w, h);
+                    pass.set_bind_group(0, &gpu.bind_group, &[]);
+                    let i = (main + k) as u32;
+                    pass.draw(0..4, i..i + 1);
+                }
+                if !drawn.is_empty() {
+                    pass.set_scissor_rect(0, 0, self.width, self.height);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                }
+                pass.draw(0..4, backgrounds as u32..main as u32);
             }
         }
         self.queue.submit([encoder.finish()]);
+        // Let go of textures for pictures no longer on screen.
+        let now = self.frame_count;
+        self.images.retain(|_, g| g.used + 300 > now);
         if let Some(f) = surface_frame {
             self.queue.present(f);
         }
         true
+    }
+
+    /// Make sure `image` has a GPU texture, and point its uniforms at this
+    /// frame. False if it can't be shown.
+    fn upload_image(&mut self, image: &Arc<Image>) -> bool {
+        let screen = [self.width as f32, self.height as f32];
+        if let Some(g) = self.images.get_mut(&image.uid) {
+            g.used = self.frame_count;
+            let u = [screen[0], screen[1], g.size.0 as f32, g.size.1 as f32];
+            self.queue
+                .write_buffer(&g.uniforms, 0, bytemuck::cast_slice(&u));
+            return true;
+        }
+        if image.width == 0 || image.height == 0 {
+            return false;
+        }
+        // Bigger than the GPU takes: shrink to fit. uv stays in the
+        // original's pixels, so the uniforms carry the original size.
+        let max = self.device.limits().max_texture_dimension_2d;
+        let shrunk;
+        let (w, h, pixels) = if image.width > max || image.height > max {
+            let s = max as f32 / image.width.max(image.height) as f32;
+            let (w, h) = (
+                ((image.width as f32 * s) as u32).max(1),
+                ((image.height as f32 * s) as u32).max(1),
+            );
+            let Some(src) =
+                image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+            else {
+                return false;
+            };
+            shrunk = image::imageops::resize(&src, w, h, image::imageops::FilterType::Triangle)
+                .into_raw();
+            (w, h, &shrunk[..])
+        } else {
+            (image.width, image.height, &image.rgba[..])
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("picture"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("picture uniforms"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let size = (image.width, image.height);
+        let u = [screen[0], screen[1], size.0 as f32, size.1 as f32];
+        self.queue
+            .write_buffer(&uniforms, 0, bytemuck::cast_slice(&u));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("picture"),
+            layout: &self.bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                },
+            ],
+        });
+        self.images.insert(
+            image.uid,
+            GpuImage {
+                bind_group,
+                uniforms,
+                size,
+                used: self.frame_count,
+            },
+        );
+        true
+    }
+
+    /// `r` as a scissor rectangle inside the target, if any of it is.
+    fn scissor(&self, r: Rect) -> Option<(u32, u32, u32, u32)> {
+        let x0 = r.x.max(0.0).floor() as u32;
+        let y0 = r.y.max(0.0).floor() as u32;
+        let x1 = ((r.x + r.w).ceil().max(0.0) as u32).min(self.width);
+        let y1 = ((r.y + r.h).ceil().max(0.0) as u32).min(self.height);
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
     }
 
     /// Read back the offscreen target as tightly packed RGBA8 rows.
