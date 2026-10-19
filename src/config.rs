@@ -27,6 +27,12 @@ pub struct Config {
     /// own), or a custom cmd.exe `PROMPT` string (`$P` path, `$G` `>`, `$E`
     /// ESC, `$_` newline).
     pub prompt: String,
+    /// The `arrow` prompt's parts: text shown first (a name, say; empty for
+    /// none), how much of the path (`full`, `folder` or `none`) and the
+    /// symbol at the end (empty for none).
+    pub prompt_name: String,
+    pub prompt_path: String,
+    pub prompt_symbol: String,
     /// What right-click does: `menu` (Copy, Paste, color schemes, shell,
     /// settings) or `paste` (copy a selection, else paste, like conhost).
     pub right_click: String,
@@ -117,6 +123,9 @@ impl Default for Config {
             scrollback_lines: 10_000,
             shell: "auto".to_string(),
             prompt: "arrow".to_string(),
+            prompt_name: String::new(),
+            prompt_path: "full".to_string(),
+            prompt_symbol: "❯".to_string(),
             right_click: "menu".to_string(),
             cursor_style: "block".to_string(),
             cursor_blink: true,
@@ -179,9 +188,88 @@ pub const ARROW_PROMPT: &str = "$E]9;9;$P$E\\$E[1;34m$P$E[0m $E[32m❯$E[0m ";
 /// spelled it out mean `arrow`.
 const OLD_ARROW_PROMPT: &str = "$E[1;34m$P$E[0m $E[32m❯$E[0m ";
 
-/// The `arrow` prompt for PowerShell, installed only when the profile
-/// hasn't set a prompt of its own (oh-my-posh, starship… win).
-pub const POWERSHELL_ARROW_PROMPT: &str = "if ((Get-Item function:prompt).ScriptBlock.ToString() -match 'executionContext\\.SessionState\\.Path\\.CurrentLocation') { function global:prompt { $e = [char]27; \"$e]9;9;$($executionContext.SessionState.Path.CurrentLocation)$e\\$e[1;34m$($executionContext.SessionState.Path.CurrentLocation)$e[0m $e[32m$([char]0x276F)$e[0m \" } }";
+/// How much of the current folder the `arrow` prompt shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptPath {
+    Full,
+    /// Just the folder's own name.
+    Folder,
+    None,
+}
+
+/// The `arrow` prompt's parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptParts {
+    pub name: String,
+    pub path: PromptPath,
+    pub symbol: String,
+}
+
+impl PromptParts {
+    /// As cmd.exe's PROMPT. cmd has no folder-name-only code, so `folder`
+    /// shows the full path there.
+    pub fn cmd(&self) -> String {
+        // $ starts a code in PROMPT; $$ is a literal one.
+        let lit = |s: &str| s.replace('$', "$$");
+        // Always report the directory (OSC 9;9) so new tabs open there.
+        let mut out = String::from("$E]9;9;$P$E\\");
+        if !self.name.is_empty() {
+            out += &format!("$E[1;35m{}$E[0m ", lit(&self.name));
+        }
+        if self.path != PromptPath::None {
+            out += "$E[1;34m$P$E[0m ";
+        }
+        if !self.symbol.is_empty() {
+            out += &format!("$E[32m{}$E[0m ", lit(&self.symbol));
+        }
+        out
+    }
+
+    /// As a PowerShell `prompt` function, installed only when the profile
+    /// hasn't set a prompt of its own (oh-my-posh, starship… win).
+    pub fn powershell(&self) -> String {
+        // Single-quoted strings take everything literally but '.
+        let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut parts = vec!["\"$e]9;9;$p$e\\\"".to_string()];
+        if !self.name.is_empty() {
+            parts.push(format!("\"$e[1;35m\" + {} + \"$e[0m \"", lit(&self.name)));
+        }
+        match self.path {
+            PromptPath::Full => parts.push("\"$e[1;34m$p$e[0m \"".into()),
+            PromptPath::Folder => parts.push(
+                // The drive root has no leaf name; show C:\ itself.
+                "\"$e[1;34m\" + $(if ($l = Split-Path -Leaf $p) { $l } else { $p }) + \"$e[0m \""
+                    .into(),
+            ),
+            PromptPath::None => {}
+        }
+        if !self.symbol.is_empty() {
+            parts.push(format!("\"$e[32m\" + {} + \"$e[0m \"", lit(&self.symbol)));
+        }
+        format!(
+            "if ((Get-Item function:prompt).ScriptBlock.ToString() -match 'executionContext\\.SessionState\\.Path\\.CurrentLocation') {{ function global:prompt {{ $e = [char]27; $p = $executionContext.SessionState.Path.CurrentLocation.Path; {} }} }}",
+            parts.join(" + ")
+        )
+    }
+
+    /// The prompt as the terminal shows it, for the settings preview.
+    pub fn sample(&self, path: &str) -> String {
+        let mut out = String::new();
+        if !self.name.is_empty() {
+            out += &format!("\x1b[1;35m{}\x1b[0m ", self.name);
+        }
+        let folder = path.rsplit('\\').next().unwrap_or(path);
+        match self.path {
+            PromptPath::Full => out += &format!("\x1b[1;34m{path}\x1b[0m "),
+            PromptPath::Folder => out += &format!("\x1b[1;34m{folder}\x1b[0m "),
+            PromptPath::None => {}
+        }
+        if !self.symbol.is_empty() {
+            out += &format!("\x1b[32m{}\x1b[0m ", self.symbol);
+        }
+        out
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -417,20 +505,33 @@ impl Config {
         let classic = prompt.is_empty() || prompt.eq_ignore_ascii_case("classic");
         let mut env = Vec::new();
         match ShellKind::of(&command) {
-            ShellKind::Cmd if arrow => env.push(("PROMPT", ARROW_PROMPT.to_string())),
+            ShellKind::Cmd if arrow => env.push(("PROMPT", self.prompt_parts().cmd())),
             ShellKind::Cmd if !classic => env.push(("PROMPT", self.prompt.clone())),
             // Only touch a PowerShell launched without its own arguments
             // (beyond -NoLogo), so a custom -Command isn't clobbered.
             ShellKind::PowerShell if arrow && !has_script_args(&command) => {
                 let cmd = format!(
                     "{command} -NoExit -EncodedCommand {}",
-                    powershell_encode(POWERSHELL_ARROW_PROMPT)
+                    powershell_encode(&self.prompt_parts().powershell())
                 );
                 return (cmd, env);
             }
             _ => {}
         }
         (command, env)
+    }
+
+    /// The `arrow` prompt as set up.
+    pub fn prompt_parts(&self) -> PromptParts {
+        PromptParts {
+            name: self.prompt_name.trim().to_string(),
+            path: match self.prompt_path.trim().to_lowercase().as_str() {
+                "folder" | "short" | "name" => PromptPath::Folder,
+                "none" | "" | "off" => PromptPath::None,
+                _ => PromptPath::Full,
+            },
+            symbol: self.prompt_symbol.trim().to_string(),
+        }
     }
 
     pub fn right_click_menu(&self) -> bool {
@@ -575,10 +676,14 @@ quake_mode = false
 # "cmd.exe", "wsl.exe ~", "C:\\Program Files\\Git\\bin\\bash.exe -i -l"
 shell = "auto"
 
-# "arrow" = blue path + ❯ (cmd and PowerShell; a prompt your PowerShell
-# profile sets wins), "classic" = the shell's own (PS C:\> or C:\>), or a
-# cmd.exe PROMPT string ($P path, $G >, $_ new line, $E[32m colors).
+# "arrow" = your name (optional), the folder and a symbol, for cmd and
+# PowerShell (a prompt your PowerShell profile sets wins). "classic" = the
+# shell's own (PS C:\> or C:\>). Or a cmd.exe PROMPT string ($P path,
+# $G >, $_ new line, $E[32m colors).
 prompt = "arrow"
+prompt_name = ""                 # shown first, e.g. "LX"; "" for none
+prompt_path = "full"             # full, folder (just its name) or none
+prompt_symbol = "❯"              # any text: ">", "$", "λ", "➜"; "" for none
 
 # "menu": right-click shows Copy, Paste, tabs, panes and settings.
 # "paste": right-click copies a selection or pastes, like the old console.
@@ -860,6 +965,36 @@ mod tests {
             ..cmd.clone()
         };
         assert!(classic.shell_command().1.is_empty());
+
+        // The default parts make the original arrow prompt.
+        assert_eq!(Config::default().prompt_parts().cmd(), ARROW_PROMPT);
+        let mine = Config {
+            prompt_name: "LX $".into(),
+            prompt_path: "none".into(),
+            prompt_symbol: "λ".into(),
+            ..cmd.clone()
+        };
+        assert_eq!(
+            mine.shell_command().1,
+            vec![(
+                "PROMPT",
+                "$E]9;9;$P$E\\$E[1;35mLX $$$E[0m $E[32mλ$E[0m ".to_string()
+            )]
+        );
+        let bare = Config {
+            prompt_symbol: "".into(),
+            prompt_path: "folder".into(),
+            prompt_name: "it's".into(),
+            ..Config::default()
+        };
+        let ps = bare.prompt_parts().powershell();
+        assert!(ps.contains("'it''s'"), "{ps}");
+        assert!(ps.contains("Split-Path -Leaf $p"), "{ps}");
+        assert!(!ps.contains("[32m"), "{ps}");
+        assert_eq!(
+            bare.prompt_parts().sample("C:\\Users\\you"),
+            "\x1b[1;35mit's\x1b[0m \x1b[1;34myou\x1b[0m "
+        );
 
         let ps = Config {
             shell: "pwsh.exe -NoLogo".into(),

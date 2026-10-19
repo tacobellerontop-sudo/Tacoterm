@@ -22,6 +22,10 @@ pub enum Kind {
         unit: &'static str,
     },
     Toggle,
+    /// Typed text. ‹ › step through `presets`, if there are any.
+    Text {
+        presets: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -172,8 +176,37 @@ impl Settings {
             Field {
                 key: "prompt",
                 label: "Prompt",
-                help: "Arrow: blue folder and ❯. Classic: the shell's own PS C:\\>. New tabs.",
-                kind: choice(&[("arrow", "Arrow ❯"), ("classic", "Classic")]),
+                help: "Styled: the name, folder and symbol below. Classic: the shell's own PS C:\\>. New tabs.",
+                kind: choice(&[("arrow", "Styled"), ("classic", "Classic")]),
+            },
+            Field {
+                key: "prompt_name",
+                label: "Prompt name",
+                help: "Type a name to show first in the prompt; Backspace deletes. Empty for none.",
+                kind: Kind::Text {
+                    presets: Vec::new(),
+                },
+            },
+            Field {
+                key: "prompt_path",
+                label: "Prompt folder",
+                help: "How much of the current folder the prompt shows (cmd always shows all of it).",
+                kind: choice(&[
+                    ("full", "Full path"),
+                    ("folder", "Folder name"),
+                    ("none", "Hidden"),
+                ]),
+            },
+            Field {
+                key: "prompt_symbol",
+                label: "Prompt symbol",
+                help: "Type your own, or ‹ › for ideas. Empty for none.",
+                kind: Kind::Text {
+                    presets: ["❯", ">", "$", "#", "%", "λ", "➜", "→", "»", "▶", ""]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                },
             },
             Field {
                 key: "tab_bar",
@@ -257,6 +290,9 @@ impl Settings {
             "cursor_blink" => c.cursor_blink.to_string(),
             "shell" => c.shell.clone(),
             "prompt" => c.prompt.trim().to_lowercase(),
+            "prompt_name" => c.prompt_name.clone(),
+            "prompt_path" => c.prompt_path.trim().to_lowercase(),
+            "prompt_symbol" => c.prompt_symbol.clone(),
             "tab_bar" => c.tab_bar.trim().to_lowercase(),
             "title_bar" => c.title_bar.trim().to_lowercase(),
             "bell" => c.bell.trim().to_lowercase(),
@@ -283,6 +319,9 @@ impl Settings {
             "cursor_blink" => c.cursor_blink = v == "true",
             "shell" => c.shell = v.to_string(),
             "prompt" => c.prompt = v.to_string(),
+            "prompt_name" => c.prompt_name = v.to_string(),
+            "prompt_path" => c.prompt_path = v.to_string(),
+            "prompt_symbol" => c.prompt_symbol = v.to_string(),
             "tab_bar" => c.tab_bar = v.to_string(),
             "title_bar" => c.title_bar = v.to_string(),
             "bell" => c.bell = v.to_string(),
@@ -315,7 +354,43 @@ impl Settings {
                 }
             }
             Kind::Toggle => if raw == "true" { "On" } else { "Off" }.to_string(),
+            Kind::Text { .. } => raw,
         }
+    }
+
+    pub fn is_text(&self, i: usize) -> bool {
+        matches!(self.fields[i].kind, Kind::Text { .. })
+    }
+
+    /// Whether ‹ › step a text setting through suggestions.
+    pub fn has_presets(&self, i: usize) -> bool {
+        matches!(&self.fields[i].kind, Kind::Text { presets } if !presets.is_empty())
+    }
+
+    /// Type into a text setting.
+    pub fn type_text(&mut self, i: usize, text: &str) {
+        if !self.is_text(i) {
+            return;
+        }
+        let key = self.fields[i].key;
+        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+        let mut v = self.raw(key);
+        // Long enough for any name; a prompt shouldn't eat the line.
+        if v.chars().count() + typed.chars().count() <= 24 {
+            v.push_str(&typed);
+            self.set_raw(key, &v);
+        }
+    }
+
+    /// Delete the last character of a text setting.
+    pub fn backspace(&mut self, i: usize) {
+        if !self.is_text(i) {
+            return;
+        }
+        let key = self.fields[i].key;
+        let mut v = self.raw(key);
+        v.pop();
+        self.set_raw(key, &v);
     }
 
     pub fn toggle_state(&self, i: usize) -> bool {
@@ -356,6 +431,16 @@ impl Settings {
                 let v = if raw == "true" { "false" } else { "true" };
                 self.set_raw(f.key, v);
             }
+            Kind::Text { presets } if !presets.is_empty() => {
+                let n = presets.len() as i32;
+                let at = presets
+                    .iter()
+                    .position(|v| v == &raw)
+                    .map_or(if delta > 0 { -1 } else { 0 }, |p| p as i32);
+                let v = presets[(at + delta).rem_euclid(n) as usize].clone();
+                self.set_raw(f.key, &v);
+            }
+            Kind::Text { .. } => {}
         }
     }
 
@@ -417,22 +502,31 @@ fn snap(v: f32, min: f32, max: f32, step: f32) -> f32 {
     ((v.clamp(min, max)) * 1000.0).round() / 1000.0
 }
 
-/// A colorful sample for the preview: a prompt, a listing, a diff, text
-/// styles and the palette.
-pub const PREVIEW_TEXT: &str = concat!(
-    "\x1b[1;34mC:\\Users\\you\\project\x1b[0m \x1b[32m❯\x1b[0m ls\r\n",
-    "\x1b[34msrc\x1b[0m   \x1b[34mtests\x1b[0m   Cargo.toml   \x1b[32mbuild.ps1\x1b[0m   README.md\r\n",
-    "\x1b[1;34mC:\\Users\\you\\project\x1b[0m \x1b[32m❯\x1b[0m git diff --stat\r\n",
-    " src/app.rs | 12 \x1b[32m++++++++\x1b[31m----\x1b[0m\r\n",
-    "\x1b[33mwarning\x1b[0m: unused variable \x1b[1m`x`\x1b[0m  \x1b[31merror\x1b[0m: oh no\r\n",
-    "\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \x1b[9mstrike\x1b[0m \x1b[2mdim\x1b[0m \x1b[7minverse\x1b[0m\r\n",
-    "┌──────────┬──────────┐\r\n",
-    "│ box      │ drawing  │  ░▒▓█\r\n",
-    "└──────────┴──────────┘\r\n",
-    "\x1b[40m  \x1b[41m  \x1b[42m  \x1b[43m  \x1b[44m  \x1b[45m  \x1b[46m  \x1b[47m  \x1b[0m\r\n",
-    "\x1b[100m  \x1b[101m  \x1b[102m  \x1b[103m  \x1b[104m  \x1b[105m  \x1b[106m  \x1b[107m  \x1b[0m\r\n",
-    "\x1b[1;34mC:\\Users\\you\\project\x1b[0m \x1b[32m❯\x1b[0m ",
-);
+/// A colorful sample for the preview: prompts as `config` draws them, a
+/// listing, a diff, text styles and the palette.
+pub fn preview_text(config: &Config) -> String {
+    const DIR: &str = "C:\\Users\\you\\project";
+    let prompt = if config.prompt.trim().eq_ignore_ascii_case("arrow") {
+        config.prompt_parts().sample(DIR)
+    } else {
+        format!("PS {DIR}> ")
+    };
+    [
+        &format!("{prompt}ls\r\n"),
+        "\x1b[34msrc\x1b[0m   \x1b[34mtests\x1b[0m   Cargo.toml   \x1b[32mbuild.ps1\x1b[0m   README.md\r\n",
+        &format!("{prompt}git diff --stat\r\n"),
+        " src/app.rs | 12 \x1b[32m++++++++\x1b[31m----\x1b[0m\r\n",
+        "\x1b[33mwarning\x1b[0m: unused variable \x1b[1m`x`\x1b[0m  \x1b[31merror\x1b[0m: oh no\r\n",
+        "\x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \x1b[9mstrike\x1b[0m \x1b[2mdim\x1b[0m \x1b[7minverse\x1b[0m\r\n",
+        "┌──────────┬──────────┐\r\n",
+        "│ box      │ drawing  │  ░▒▓█\r\n",
+        "└──────────┴──────────┘\r\n",
+        "\x1b[40m  \x1b[41m  \x1b[42m  \x1b[43m  \x1b[44m  \x1b[45m  \x1b[46m  \x1b[47m  \x1b[0m\r\n",
+        "\x1b[100m  \x1b[101m  \x1b[102m  \x1b[103m  \x1b[104m  \x1b[105m  \x1b[106m  \x1b[107m  \x1b[0m\r\n",
+        &prompt,
+    ]
+    .concat()
+}
 
 #[cfg(test)]
 mod tests {
@@ -507,6 +601,26 @@ mod tests {
         assert_eq!(back.opacity, 0.9);
         assert_eq!(back.backdrop, "acrylic");
         assert_eq!(back.scrollback_lines, 50000);
+    }
+
+    #[test]
+    fn prompt_text_types_and_cycles() {
+        let mut s = page();
+        let name = index(&s, "prompt_name");
+        s.type_text(name, "LX");
+        s.type_text(name, "\u{8}!");
+        assert_eq!(s.draft.prompt_name, "LX!");
+        s.backspace(name);
+        assert_eq!(s.value_text(name), "LX");
+        s.adjust(name, 1);
+        assert_eq!(s.draft.prompt_name, "LX", "no presets: arrows do nothing");
+        let sym = index(&s, "prompt_symbol");
+        s.adjust(sym, 1);
+        assert_eq!(s.draft.prompt_symbol, ">");
+        s.adjust(sym, -2);
+        assert_eq!(s.draft.prompt_symbol, "", "the last preset is none");
+        assert!(s.changes().contains(&("prompt_name", "\"LX\"".to_string())));
+        assert!(preview_text(&s.draft).starts_with("\x1b[1;35mLX\x1b[0m \x1b[1;34mC:"));
     }
 
     #[test]
