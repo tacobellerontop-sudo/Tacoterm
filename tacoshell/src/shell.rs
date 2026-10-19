@@ -1,6 +1,7 @@
 //! Running command lines: expansion, pipelines, redirections, programs and
 //! the built-in commands.
 
+use crate::commands::{self, Input, Source};
 use crate::parse::{self, Connector, Part, Pipeline, Redirect, Script, Word};
 use crate::resolve;
 use std::collections::HashMap;
@@ -10,9 +11,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 
 pub const BUILTINS: &[&str] = &[
-    "alias", "cd", "clear", "cls", "echo", "env", "exit", "export", "false", "help", "history",
-    "ls", "pwd", "set", "source", "true", "unalias", "unset", "which",
+    "alias", "cd", "clear", "cls", "dirs", "echo", "env", "exit", "export", "false", "help",
+    "history", "ls", "popd", "pushd", "pwd", "set", "source", "true", "unalias", "unset", "which",
 ];
+
+/// The shell's own commands and the everyday ones in `commands`.
+pub fn is_builtin(name: &str) -> bool {
+    BUILTINS.contains(&name) || commands::NAMES.contains(&name)
+}
 
 const HISTORY_MAX: usize = 1000;
 
@@ -25,6 +31,8 @@ pub struct Shell {
     pub exit: Option<i32>,
     history_file: Option<PathBuf>,
     prev_dir: Option<PathBuf>,
+    /// `pushd` / `popd`
+    dir_stack: Vec<PathBuf>,
 }
 
 /// A command with its words expanded.
@@ -130,6 +138,7 @@ impl Shell {
             exit: None,
             history_file: None,
             prev_dir: None,
+            dir_stack: Vec::new(),
         }
     }
 
@@ -195,7 +204,11 @@ impl Shell {
     /// Names that complete in command position: built-ins, aliases and
     /// programs on PATH.
     pub fn command_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = BUILTINS.iter().map(|s| s.to_string()).collect();
+        let mut names: Vec<String> = BUILTINS
+            .iter()
+            .chain(commands::NAMES)
+            .map(|s| s.to_string())
+            .collect();
         names.extend(self.aliases.keys().cloned());
         if cfg!(windows) {
             names.extend(resolve::CMD_BUILTINS.iter().map(|s| s.to_string()));
@@ -308,14 +321,14 @@ impl Shell {
             let stage = (|| -> Result<Option<i32>, (String, i32)> {
                 let fail = |what: &str, e: std::io::Error| (format!("{what}: {e}"), 1);
                 // Where input comes from and output goes.
-                let mut stdin = prev.take().map(Stdio::from);
+                let mut stdin = prev.take().map(Source::Pipe);
                 let mut stdout = Sink::Inherit;
                 let mut stderr = Sink::Inherit;
                 let mut err_to_out = false;
                 for r in &cmd.redirects {
                     match r {
                         Redir::In(path) => {
-                            stdin = Some(Stdio::from(File::open(path).map_err(|e| fail(path, e))?))
+                            stdin = Some(Source::File(File::open(path).map_err(|e| fail(path, e))?))
                         }
                         Redir::Out { fd, append, path } => {
                             let file = OpenOptions::new()
@@ -346,15 +359,19 @@ impl Shell {
                 let Some(name) = cmd.args.first() else {
                     return Ok(Some(0));
                 };
-                if let Some(status) =
-                    self.try_builtin(&cmd.args, &mut stdout, &mut stderr, &mut writers)
-                {
+                if let Some(status) = self.try_builtin(
+                    &cmd.args,
+                    &mut stdin,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut writers,
+                ) {
                     return Ok(Some(status));
                 }
                 let mut command = self.program(name, &cmd.args[1..]).map_err(|e| (e, 127))?;
                 command.stdout(stdout.stdio()).stderr(stderr.stdio());
                 if let Some(stdin) = stdin {
-                    command.stdin(stdin);
+                    command.stdin(stdin.stdio());
                 }
                 let child = command.spawn().map_err(|e| (format!("{name}: {e}"), 126))?;
                 children.push(Some(child));
@@ -440,6 +457,7 @@ impl Shell {
     fn try_builtin(
         &mut self,
         args: &[String],
+        stdin: &mut Option<Source>,
         stdout: &mut Sink,
         stderr: &mut Sink,
         writers: &mut Vec<std::thread::JoinHandle<()>>,
@@ -452,7 +470,7 @@ impl Shell {
             && name.as_bytes()[0].is_ascii_alphabetic();
         let assignment = args.len() == 1 && is_assignment(name).is_some();
         let builtin = if cfg!(windows) { lower.as_str() } else { name };
-        if !(BUILTINS.contains(&builtin) || builtin == "cd.." || is_drive || assignment) {
+        if !(is_builtin(builtin) || builtin == "cd.." || is_drive || assignment) {
             return None;
         }
         let mut out: Vec<u8> = Vec::new();
@@ -466,7 +484,13 @@ impl Shell {
         } else if builtin == "cd.." {
             self.cd(&["..".to_string()], &mut out, &mut err)
         } else {
-            self.builtin(builtin, &args[1..], &mut out, &mut err)
+            self.builtin(
+                builtin,
+                &args[1..],
+                &mut Input(stdin.take()),
+                &mut out,
+                &mut err,
+            )
         };
         // Output is gathered first and then handed over, so a builtin
         // feeding a pipe can't block on a reader that hasn't started yet.
@@ -497,6 +521,7 @@ impl Shell {
         &mut self,
         name: &str,
         args: &[String],
+        input: &mut Input,
         out: &mut Vec<u8>,
         err: &mut Vec<u8>,
     ) -> i32 {
@@ -537,7 +562,7 @@ impl Shell {
                     2
                 }
             },
-            "set" | "export" if args.is_empty() => self.builtin("env", args, out, err),
+            "set" | "export" if args.is_empty() => self.builtin("env", args, input, out, err),
             "set" | "export" => {
                 let mut status = 0;
                 for arg in args {
@@ -581,7 +606,7 @@ impl Shell {
                     };
                     if let Some(value) = self.aliases.get(&key) {
                         let _ = writeln!(out, "{arg}: alias for {value}");
-                    } else if BUILTINS.contains(&lower.as_str()) {
+                    } else if is_builtin(&lower) {
                         let _ = writeln!(out, "{arg}: tacoshell built-in");
                     } else if let Some(path) = resolve::find(arg) {
                         let _ = writeln!(out, "{}", path.display());
@@ -659,7 +684,49 @@ impl Shell {
                 }
             },
             "ls" => ls(args, out, err),
-            _ => unreachable!("{name} is in BUILTINS"),
+            "pushd" => {
+                let here = std::env::current_dir().unwrap_or_default();
+                let target = match args.first() {
+                    Some(dir) => PathBuf::from(dir),
+                    None => match self.dir_stack.pop() {
+                        Some(top) => top,
+                        None => {
+                            let _ = writeln!(err, "pushd: no other folder");
+                            return 1;
+                        }
+                    },
+                };
+                let status = self.cd(&[target.display().to_string()], out, err);
+                if status == 0 {
+                    self.dir_stack.push(here);
+                    self.builtin("dirs", &[], input, out, err);
+                }
+                status
+            }
+            "popd" => match self.dir_stack.pop() {
+                Some(dir) => {
+                    let status = self.cd(&[dir.display().to_string()], out, err);
+                    self.builtin("dirs", &[], input, out, err);
+                    status
+                }
+                None => {
+                    let _ = writeln!(err, "popd: the folder stack is empty");
+                    1
+                }
+            },
+            "dirs" => {
+                let here = std::env::current_dir().unwrap_or_default();
+                let all: Vec<String> = std::iter::once(&here)
+                    .chain(self.dir_stack.iter().rev())
+                    .map(|p| tilde(p))
+                    .collect();
+                let _ = writeln!(out, "{}", all.join(" "));
+                0
+            }
+            _ => match commands::run(name, args, input, out, err) {
+                Some(status) => status,
+                None => unreachable!("{name} is a built-in"),
+            },
         }
     }
 
@@ -798,6 +865,18 @@ Built-ins:
   set NAME=value  (or NAME=value)   unset NAME    env    list variables
   alias name='cmd args'   unalias name   which name   history [-c]
   source file  run a file of commands       exit [code]
+  pushd dir / popd / dirs   a stack of folders to go back to
+
+Files and text (they read files, or a pipe or < file when given none):
+  cat  head [-n N]  tail [-n N]  wc [-l -w -c]  sort [-r -n -f -u]  uniq [-c]
+  grep [-i -v -n -c -F] PATTERN   tee [-a] file
+  mkdir [-p]  touch  cp [-r]  mv  rm [-r -f]  basename  dirname  realpath
+  sleep secs   open file-or-url (in its usual app)
+
+Pictures:
+  img [-k | -s | -b] [-w columns] picture   kitty graphics, sixel, or
+               colored blocks (works everywhere); picks kitty in terminals
+               known to show it. TACOSHELL_IMG=kitty|sixel|blocks overrides.
 
 cmd.exe's own commands (dir, copy, del, type, mklink, start, ...) run through
 cmd. %APPDATA%\\tacoshell\\init.tsh runs at startup, for aliases and such.

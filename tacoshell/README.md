@@ -22,9 +22,17 @@ settings page (or set `shell = "tacoshell.exe"` in `config.toml`).
 - Programs from PATH using PATHEXT (`.exe`, `.cmd`, `.bat`, …); `.ps1`
   scripts run through PowerShell; cmd's own commands (`dir`, `copy`, `del`,
   `type`, `mklink`, `start`, …) run through `cmd /c`
-- Built-ins: `cd` (`cd -`, `cd..`, `D:`), `ls`, `pwd`, `echo`, `set`,
-  `export`, `unset`, `env`, `alias`, `unalias`, `which`, `history`,
-  `clear`/`cls`, `source`, `help`, `exit`
+- Built-ins: `cd` (`cd -`, `cd..`, `D:`), `pushd`/`popd`/`dirs`, `ls`,
+  `pwd`, `echo`, `set`, `export`, `unset`, `env`, `alias`, `unalias`,
+  `which`, `history`, `clear`/`cls`, `source`, `help`, `exit`
+- The everyday Unix commands, built in so they're on every machine: `cat`,
+  `head`, `tail`, `wc`, `grep` (regex), `sort`, `uniq`, `tee`, `mkdir`,
+  `touch`, `cp`, `mv`, `rm`, `basename`, `dirname`, `realpath`, `sleep`,
+  `open`. They read files, or a pipe or `< file` when given none
+- Pictures: `img photo.png` shows one with the kitty graphics protocol
+  (`-k`), sixel (`-s`) or colored half-blocks that work in any terminal
+  (`-b`). It picks kitty where the terminal is known to show it;
+  `TACOSHELL_IMG=kitty|sixel|blocks` overrides
 - Line editing: Tab completes commands and paths, Up/Down history (kept in
   `%APPDATA%\tacoshell\history`), Ctrl+Left/Right, Ctrl+W/U/K, Esc,
   Ctrl+L, Ctrl+C, Ctrl+D
@@ -35,7 +43,7 @@ settings page (or set `shell = "tacoshell.exe"` in `config.toml`).
 
 ## Not yet
 
-Globbing (`*.txt`), command substitution, `if`/loops/functions, background
+Globbing (`*.txt`), `ls -l`, command substitution, `if`/loops/functions, background
 jobs, and a configurable prompt.
 
 It also builds on Linux and macOS, so `cargo test` runs anywhere.

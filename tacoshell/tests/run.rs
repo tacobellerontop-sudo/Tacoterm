@@ -113,3 +113,16 @@ fn parse_errors() {
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("missing closing"));
 }
+
+#[test]
+fn builtins_read_pipes_and_files() {
+    let dir = scratch("text");
+    let o = run_in(
+        &dir,
+        "echo cherry > f.txt; echo apple >> f.txt; echo banana >> f.txt; \
+         cat f.txt | sort | head -n 2; grep -c an < f.txt; cat f.txt | grep -v e | wc -l; \
+         mkdir -p a/b && touch a/b/x && ls a/b && rm -r a && ls",
+    );
+    assert_eq!(stdout(&o), "apple\nbanana\n1\n1\nx\nf.txt\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

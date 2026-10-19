@@ -3,8 +3,10 @@
 //! `tacoshell` starts an interactive shell, `tacoshell -c "line"` runs one
 //! line, and `tacoshell file.tsh` runs a file of lines.
 
+mod commands;
 mod complete;
 mod editor;
+mod img;
 mod parse;
 mod resolve;
 mod shell;

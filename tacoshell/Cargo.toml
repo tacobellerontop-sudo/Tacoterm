@@ -6,6 +6,10 @@ description = "A native command shell for Windows, the companion to tacoterm"
 license = "MIT"
 
 [dependencies]
+# Decoding pictures for the `img` built-in
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+# Patterns for the `grep` built-in
+regex = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 # Column width of wide (CJK, emoji) characters in the line editor
 unicode-width = "0.2"
 
