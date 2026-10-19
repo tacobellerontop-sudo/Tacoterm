@@ -9,7 +9,7 @@ use tacoterm::config::{self, Config};
 use tacoterm::grid::Grid;
 use tacoterm::layout::Rect;
 use tacoterm::renderer::{Control, SettingsHit, SettingsPage, SettingsRow};
-use tacoterm::settings::{Kind, Settings, PREVIEW_TEXT};
+use tacoterm::settings::{preview_text, Kind, Settings};
 use tacoterm::vt::Vt;
 
 use super::{show_warning, App};
@@ -20,13 +20,15 @@ pub(super) struct Page {
     hover: Option<SettingsHit>,
     /// The sample terminal in the preview.
     preview: Grid,
+    /// What the preview shows, to rebuild it only when that changes.
+    preview_text: String,
     /// A slider being dragged.
     dragging: Option<usize>,
 }
 
-fn sample(cols: usize, rows: usize) -> Grid {
+fn sample(cols: usize, rows: usize, text: &str) -> Grid {
     let mut grid = Grid::new(cols.max(1), rows.max(1), 0);
-    Vt::new().advance(&mut grid, PREVIEW_TEXT.as_bytes());
+    Vt::new().advance(&mut grid, text.as_bytes());
     grid
 }
 
@@ -54,6 +56,7 @@ impl App {
             scroll: 0,
             hover: None,
             preview: Grid::new(1, 1, 0),
+            preview_text: String::new(),
             dragging: None,
         });
         self.fit_preview();
@@ -83,8 +86,12 @@ impl App {
             return;
         };
         let (cols, rows) = r.pane_grid_size(r.settings_preview_rect(area));
-        if (cols as usize, rows as usize) != (page.preview.cols, page.preview.rows) {
-            page.preview = sample(cols as usize, rows as usize);
+        let text = preview_text(&page.model.draft);
+        if (cols as usize, rows as usize) != (page.preview.cols, page.preview.rows)
+            || text != page.preview_text
+        {
+            page.preview = sample(cols as usize, rows as usize, &text);
+            page.preview_text = text;
         }
     }
 
@@ -129,6 +136,33 @@ impl App {
         let sel = page.model.selected;
         let n = page.model.fields.len();
         let ctrl = self.mods.control_key();
+        if page.model.is_text(sel) && !ctrl {
+            match &event.logical_key {
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(page) = &mut self.page {
+                        page.model.backspace(sel);
+                    }
+                    return self.settings_changed();
+                }
+                Key::Named(NamedKey::Delete) => {
+                    if let Some(page) = &mut self.page {
+                        while !page.model.value_text(sel).is_empty() {
+                            page.model.backspace(sel);
+                        }
+                    }
+                    return self.settings_changed();
+                }
+                Key::Character(_) | Key::Named(NamedKey::Space) => {
+                    if let Some(text) = &event.text {
+                        if let Some(page) = &mut self.page {
+                            page.model.type_text(sel, text);
+                        }
+                        return self.settings_changed();
+                    }
+                }
+                _ => {}
+            }
+        }
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.close_settings(false),
             Key::Named(NamedKey::ArrowUp) => self.select(sel.saturating_sub(1)),
@@ -258,6 +292,9 @@ fn rows(m: &Settings) -> Vec<SettingsRow> {
                 Kind::Choice(_) => Control::Choice,
                 Kind::Number { .. } => Control::Slider(m.fraction(i).unwrap_or(0.0)),
                 Kind::Toggle => Control::Toggle(m.toggle_state(i)),
+                Kind::Text { .. } => Control::Text {
+                    presets: m.has_presets(i),
+                },
             },
         })
         .collect()

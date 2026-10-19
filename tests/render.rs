@@ -9,7 +9,7 @@ use tacoterm::layout::{Layout, Rect, Split};
 use tacoterm::renderer::{
     Control, Fonts, Frame, PaneView, Renderer, SearchBar, SettingsPage, SettingsRow, TabHit,
 };
-use tacoterm::settings::{Kind, Settings, PREVIEW_TEXT};
+use tacoterm::settings::{preview_text, Kind, Settings};
 use tacoterm::vt::Vt;
 
 #[test]
@@ -191,7 +191,13 @@ fn renders_settings_page_and_window_buttons() {
     let area = Rect::new(0.0, bar, w as f32, h as f32 - bar);
 
     let mut model = Settings::new(&config, vec!["Cascadia Mono".into()], Vec::new());
-    model.selected = 1;
+    let name = model
+        .fields
+        .iter()
+        .position(|f| f.key == "prompt_name")
+        .unwrap();
+    model.type_text(name, "LX");
+    model.selected = name;
     let rows: Vec<SettingsRow> = model
         .fields
         .iter()
@@ -203,22 +209,25 @@ fn renders_settings_page_and_window_buttons() {
                 Kind::Choice(_) => Control::Choice,
                 Kind::Number { .. } => Control::Slider(model.fraction(i).unwrap_or(0.0)),
                 Kind::Toggle => Control::Toggle(model.toggle_state(i)),
+                Kind::Text { .. } => Control::Text {
+                    presets: model.has_presets(i),
+                },
             },
         })
         .collect();
     let prect = renderer.settings_preview_rect(area);
     let (pc, pr) = renderer.pane_grid_size(prect);
     let mut preview = Grid::new(pc as usize, pr as usize, 0);
-    Vt::new().advance(&mut preview, PREVIEW_TEXT.as_bytes());
+    Vt::new().advance(&mut preview, preview_text(&model.draft).as_bytes());
 
     // Clicks find the right controls.
     let n = rows.len();
     let page = |rows: Vec<SettingsRow>| SettingsPage {
         area,
         rows,
-        selected: 1,
+        selected: model.selected,
         scroll: 0,
-        help: model.fields[1].help,
+        help: model.fields[model.selected].help,
         preview: &preview,
         dirty: true,
         hover: None,

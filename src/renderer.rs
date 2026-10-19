@@ -449,6 +449,10 @@ pub enum Control {
     /// A slider at this position, 0..=1.
     Slider(f32),
     Toggle(bool),
+    /// A text box; `presets` shows ‹ › to step through suggestions.
+    Text {
+        presets: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1869,6 +1873,13 @@ impl Renderer {
                     return Some(SettingsHit::Slider(i, t));
                 }
             }
+            match rows[i].control {
+                Control::Text { presets: false } => return Some(SettingsHit::Row(i)),
+                Control::Text { presets: true } if value.contains(x, y) => {
+                    return Some(SettingsHit::Row(i))
+                }
+                _ => {}
+            }
             if prev.contains(x, y) {
                 return Some(SettingsHit::Prev(i));
             }
@@ -2026,6 +2037,71 @@ impl Renderer {
                         fg_c,
                         6.0 * cw,
                     )?;
+                }
+                Control::Text { presets } => {
+                    let (x0, x1) = if presets {
+                        (value.x, value.x + value.w)
+                    } else {
+                        (prev.x, next.x + next.w)
+                    };
+                    let bh = (row.h * 0.7).round();
+                    let by = (row.y + (row.h - bh) / 2.0).round();
+                    layers
+                        .backgrounds
+                        .push(Instance::rect(x0, by, x1 - x0, bh, faint));
+                    // An underline marks it as a box to type in.
+                    layers.decorations.push(Instance::rect(
+                        x0,
+                        by + bh - line.max(1.0),
+                        x1 - x0,
+                        line.max(1.0),
+                        if selected {
+                            accent
+                        } else {
+                            self.color(fg, 0.3)
+                        },
+                    ));
+                    if presets {
+                        let arrow = |h: SettingsHit| {
+                            if page.hover == Some(h) {
+                                fg_c
+                            } else {
+                                dim
+                            }
+                        };
+                        self.text(
+                            &mut layers.glyphs,
+                            (prev.x + cw * 0.75, ty),
+                            "‹",
+                            arrow(SettingsHit::Prev(*i)),
+                            cw * 2.0,
+                        )?;
+                        self.text(
+                            &mut layers.glyphs,
+                            (next.x + cw * 0.75, ty),
+                            "›",
+                            arrow(SettingsHit::Next(*i)),
+                            cw * 2.0,
+                        )?;
+                    }
+                    let tx = x0 + cw * 0.5;
+                    let w = if r.value.is_empty() {
+                        if !selected {
+                            self.text(&mut layers.glyphs, (tx, ty), "none", dim, x1 - tx)?;
+                        }
+                        0.0
+                    } else {
+                        self.text(&mut layers.glyphs, (tx, ty), &r.value, fg_c, x1 - tx)?
+                    };
+                    if selected && cursor_on {
+                        layers.decorations.push(Instance::rect(
+                            (tx + w + 1.0).round(),
+                            by + bh * 0.15,
+                            (line * 2.0).max(2.0),
+                            bh * 0.7,
+                            fg_c,
+                        ));
+                    }
                 }
                 Control::Toggle(on) => {
                     let pw = 3.5 * cw;

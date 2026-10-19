@@ -81,7 +81,10 @@ opacity = 0.85                   # 1.0 is solid
 backdrop = "acrylic"             # none, acrylic, mica or tabbed (Windows 11)
 
 shell = "auto"                   # PowerShell; or "cmd.exe", "wsl.exe ~", …
-prompt = "arrow"                 # path + ❯; "classic" = the shell's own
+prompt = "arrow"                 # styled; "classic" = the shell's own
+prompt_name = "LX"               # shown first; "" for none
+prompt_path = "folder"           # full, folder or none
+prompt_symbol = "λ"              # any text; "" for none
 right_click = "menu"             # or "paste", like the old console
 title_bar = "custom"             # see-through; "system" = the Windows one
 
