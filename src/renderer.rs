@@ -145,7 +145,7 @@ impl Fonts {
             }
             SwashContent::SubpixelMask => {
                 let mut rgba = Vec::with_capacity(pixels * 4);
-                for px in image.data.chunks_exact(4).take(pixels) {
+                for px in image.data.as_chunks::<4>().0.iter().take(pixels) {
                     let a = ((px[0] as u16 + px[1] as u16 + px[2] as u16) / 3) as u8;
                     rgba.extend_from_slice(&[255, 255, 255, a]);
                 }
