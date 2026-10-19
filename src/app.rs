@@ -21,7 +21,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::windows::{BackdropType, WindowAttributesExtWindows, WindowExtWindows};
 use winit::window::{
-    Fullscreen, Theme as WindowTheme, UserAttentionType, Window, WindowId, WindowLevel,
+    CursorIcon, Fullscreen, ResizeDirection, Theme as WindowTheme, UserAttentionType, Window,
+    WindowId, WindowLevel,
 };
 
 use tacoterm::config::{self, Backdrop, Config, ShellKind};
@@ -32,6 +33,8 @@ use tacoterm::mouse::{self, MouseEventKind, MouseMods};
 use tacoterm::renderer::{Fonts, Frame, PaneView, Renderer, SearchBar, TabHit};
 use tacoterm::schemes;
 use tacoterm::vt::Vt;
+
+mod page;
 
 use crate::menu;
 use crate::pty::Pty;
@@ -263,6 +266,15 @@ struct App {
     link: Option<Link>,
     /// Hidden by the summon hotkey.
     hidden: bool,
+    /// The settings page, while it is open.
+    page: Option<page::Page>,
+    /// We draw the title bar ourselves (in the tab strip), so the whole
+    /// window can be see-through. Fixed when the window is made.
+    custom_frame: bool,
+    /// The last click on bare title bar, to catch double-clicks.
+    title_click: Option<Instant>,
+    /// The tab-strip control under the mouse.
+    tab_hover: Option<TabHit>,
 }
 
 impl App {
@@ -302,6 +314,10 @@ impl App {
             flash_until: None,
             link: None,
             hidden: false,
+            page: None,
+            custom_frame: false,
+            title_click: None,
+            tab_hover: None,
         }
     }
 
@@ -327,6 +343,10 @@ impl App {
     // ---- tabs and panes ---------------------------------------------------
 
     fn show_tabs(&self) -> bool {
+        if self.custom_frame {
+            // The strip is the title bar.
+            return true;
+        }
         match self.config.tab_bar.trim().to_lowercase().as_str() {
             "never" => false,
             "multiple" | "auto" => self.tabs.len() > 1,
@@ -592,6 +612,7 @@ impl App {
             }
         }
         self.refresh_search();
+        self.fit_preview();
         self.redraw();
     }
 
@@ -666,7 +687,8 @@ impl App {
             Some(menu::Choice::Paste) => self.paste(),
             Some(menu::Choice::SelectAll) => self.run_action(Action::SelectAll),
             Some(menu::Choice::Fullscreen) => self.run_action(Action::Fullscreen),
-            Some(menu::Choice::Settings) => self.run_action(Action::OpenSettings),
+            Some(menu::Choice::Settings) => self.open_settings(),
+            Some(menu::Choice::EditFile) => self.edit_settings_file(),
             Some(menu::Choice::Scheme(name)) => {
                 // Show it now; saving makes the file watcher agree.
                 self.scheme = name.to_string();
@@ -703,6 +725,19 @@ impl App {
             None => {}
         }
         self.redraw();
+    }
+
+    /// Open config.toml in Notepad, writing the starter file first if
+    /// there isn't one yet.
+    fn edit_settings_file(&self) {
+        let path = config::config_path();
+        if !path.exists() {
+            // Writing any key makes the file from the starter text.
+            let _ = config::set_top_levels(&[]);
+        }
+        if let Err(e) = std::process::Command::new("notepad.exe").arg(&path).spawn() {
+            show_warning(format!("cannot open {}: {e}", path.display()));
+        }
     }
 
     fn save_setting(&self, key: &str, toml_value: &str) {
@@ -769,9 +804,20 @@ impl App {
                 return;
             }
         };
-        let (bindings, mut warnings) = Bindings::from_config(&config.keybindings);
+        let (_, mut warnings) = Bindings::from_config(&config.keybindings);
         warnings.extend(config.warnings());
         self.report(warnings);
+        if self.page.is_some() {
+            // The page shows its own draft; a hand edit made meanwhile
+            // shows once it closes and the file is saved again.
+            return;
+        }
+        self.apply_config(config);
+    }
+
+    /// Put `config` on screen: everything that can change without a restart.
+    fn apply_config(&mut self, config: Config) {
+        let (bindings, _) = Bindings::from_config(&config.keybindings);
         self.bindings = bindings;
         for p in self.panes.values_mut() {
             p.grid.scrollback_limit = config.scrollback_lines;
@@ -1022,12 +1068,8 @@ impl App {
                 }
             }
             Action::NextColorScheme => self.next_scheme(),
-            Action::OpenSettings => {
-                let path = config::config_path();
-                if let Err(e) = std::process::Command::new("notepad.exe").arg(&path).spawn() {
-                    show_warning(format!("cannot open {}: {e}", path.display()));
-                }
-            }
+            Action::OpenSettings if self.settings_open() => self.close_settings(false),
+            Action::OpenSettings => self.open_settings(),
         }
         self.redraw();
     }
@@ -1246,19 +1288,90 @@ impl App {
             return false;
         }
         let hit = r.tab_hit(self.mouse_pos.0, self.mouse_pos.1, self.tabs.len());
+        if matches!(hit, Some(TabHit::Tab(_) | TabHit::Close(_) | TabHit::New)) {
+            // Going to a tab leaves the page, putting things back.
+            self.close_settings(false);
+        }
         match (button, hit) {
             (MouseButton::Left, Some(TabHit::Tab(i))) => self.switch_tab(i),
             (MouseButton::Left, Some(TabHit::Close(i)))
             | (MouseButton::Middle, Some(TabHit::Tab(i))) => self.close_tab(i),
             (MouseButton::Left, Some(TabHit::New)) => self.run_action(Action::NewTab),
+            (MouseButton::Left, Some(TabHit::Settings)) => self.run_action(Action::OpenSettings),
+            (MouseButton::Left, Some(TabHit::Minimize)) => {
+                if let Some(w) = &self.window {
+                    w.set_minimized(true);
+                }
+            }
+            (MouseButton::Left, Some(TabHit::Maximize)) => self.toggle_maximized(),
+            (MouseButton::Left, Some(TabHit::CloseWindow)) => self.close_window(),
+            (MouseButton::Left, Some(TabHit::Empty)) if self.custom_frame => {
+                let now = Instant::now();
+                if self.title_click.is_some_and(|t| now - t < MULTI_CLICK) {
+                    self.title_click = None;
+                    self.toggle_maximized();
+                } else {
+                    self.title_click = Some(now);
+                    if let Some(w) = &self.window {
+                        let _ = w.drag_window();
+                    }
+                }
+            }
             _ => {}
         }
         true
     }
 
+    fn toggle_maximized(&self) {
+        if let Some(w) = &self.window {
+            w.set_maximized(!w.is_maximized());
+        }
+    }
+
+    fn close_window(&mut self) {
+        for p in self.panes.values_mut() {
+            let _ = p.pty.terminate();
+        }
+        self.quit = true;
+    }
+
+    /// Which window edge the mouse is on, for resizing a window we draw
+    /// the frame of.
+    fn resize_edge(&self) -> Option<ResizeDirection> {
+        let w = self.window.as_ref()?;
+        if !self.custom_frame || w.is_maximized() || w.fullscreen().is_some() {
+            return None;
+        }
+        let size = w.inner_size();
+        let border = (6.0 * w.scale_factor()).max(4.0);
+        let (x, y) = self.mouse_pos;
+        let (left, right) = (x < border, x >= size.width as f64 - border);
+        let (top, bottom) = (y < border, y >= size.height as f64 - border);
+        Some(match (left, right, top, bottom) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (_, true, true, _) => ResizeDirection::NorthEast,
+            (true, _, _, true) => ResizeDirection::SouthWest,
+            (_, true, _, true) => ResizeDirection::SouthEast,
+            (true, ..) => ResizeDirection::West,
+            (_, true, ..) => ResizeDirection::East,
+            (_, _, true, _) => ResizeDirection::North,
+            (.., true) => ResizeDirection::South,
+            _ => return None,
+        })
+    }
+
     fn left_press(&mut self) {
+        if let Some(dir) = self.resize_edge() {
+            if let Some(w) = &self.window {
+                let _ = w.drag_resize_window(dir);
+            }
+            return;
+        }
         if self.tab_click(MouseButton::Left) {
             return;
+        }
+        if self.settings_open() {
+            return self.settings_press();
         }
         let Some(id) = self.pane_under_mouse() else {
             return;
@@ -1303,6 +1416,9 @@ impl App {
     }
 
     fn left_release(&mut self) {
+        if self.settings_open() {
+            return self.settings_release();
+        }
         if let Some((id, button)) = self.reported_button.take() {
             self.report_mouse(id, button, MouseEventKind::Release);
             return;
@@ -1313,7 +1429,42 @@ impl App {
         }
     }
 
+    /// Keep the tab-strip hover and the resize cursor up to date.
+    fn chrome_hover(&mut self) {
+        let edge = self.resize_edge();
+        if let Some(w) = &self.window {
+            w.set_cursor(match edge {
+                Some(ResizeDirection::East | ResizeDirection::West) => CursorIcon::EwResize,
+                Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
+                Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => {
+                    CursorIcon::NwseResize
+                }
+                Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => {
+                    CursorIcon::NeswResize
+                }
+                None => CursorIcon::Default,
+            });
+        }
+        let hover = match (&self.renderer, edge) {
+            (Some(r), None) if self.show_tabs() => {
+                r.tab_hit(self.mouse_pos.0, self.mouse_pos.1, self.tabs.len())
+            }
+            _ => None,
+        };
+        if hover != self.tab_hover {
+            self.tab_hover = hover;
+            if let Some(r) = &mut self.renderer {
+                r.hover = hover;
+            }
+            self.redraw();
+        }
+    }
+
     fn mouse_moved(&mut self) {
+        self.chrome_hover();
+        if self.settings_open() {
+            return self.settings_motion();
+        }
         if let Some((id, button)) = self.reported_button {
             self.report_mouse(id, button, MouseEventKind::Motion);
             return;
@@ -1346,6 +1497,9 @@ impl App {
 
     fn other_button(&mut self, button: MouseButton, state: ElementState) {
         if state == ElementState::Pressed && self.tab_click(button) {
+            return;
+        }
+        if self.settings_open() {
             return;
         }
         let Some(id) = self.pane_under_mouse() else {
@@ -1401,6 +1555,9 @@ impl App {
         let n = whole as isize;
         if n == 0 {
             return;
+        }
+        if self.settings_open() {
+            return self.settings_wheel(n);
         }
         let Some(id) = self.pane_under_mouse() else {
             return;
@@ -1500,6 +1657,18 @@ impl App {
             Vec::new()
         };
         let search = self.search.as_ref();
+        let settings = self.page.as_ref().map(|p| p.view(area));
+        // The page takes the place of the panes.
+        let rects = if settings.is_some() {
+            Vec::new()
+        } else {
+            rects
+        };
+        let dividers = if settings.is_some() {
+            Vec::new()
+        } else {
+            dividers
+        };
         let panes = rects
             .iter()
             .filter_map(|(id, rect)| {
@@ -1547,6 +1716,7 @@ impl App {
             }),
             cursor_on: self.cursor_on,
             flash: self.flash_until.is_some_and(|t| Instant::now() < t),
+            settings,
         };
         let Some(r) = &mut self.renderer else { return };
         if !r.render(&frame) {
@@ -1568,7 +1738,9 @@ impl ApplicationHandler<Wake> for App {
             .unwrap_or(1.0);
         let fonts = Fonts::new(&self.config, scale);
         let pad = (self.config.padding as f64 * scale).round() as u32;
-        let bar = if self.config.tab_bar.trim().eq_ignore_ascii_case("always") {
+        let quake = self.config.quake_mode;
+        let custom = self.config.custom_title_bar() && !quake;
+        let bar = if custom || self.config.tab_bar.trim().eq_ignore_ascii_case("always") {
             fonts.tab_bar_height()
         } else {
             0
@@ -1577,38 +1749,68 @@ impl ApplicationHandler<Wake> for App {
             80 * fonts.cell_width + 2 * pad,
             24 * fonts.cell_height + 2 * pad + bar,
         );
-        let quake = self.config.quake_mode;
         let mut attrs = Window::default_attributes()
             .with_title("tacoterm")
             .with_theme(Some(title_bar_theme(self.config.theme().0.background)))
             .with_inner_size(size)
-            // See-through needs an alpha-capable window from the start; it
-            // costs nothing while opacity is 1.
-            .with_transparent(true)
             .with_system_backdrop(backdrop_type(self.config.backdrop()));
         if quake {
             attrs = attrs
-                .with_decorations(false)
                 .with_window_level(WindowLevel::AlwaysOnTop)
                 .with_skip_taskbar(true);
         }
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => return self.fail(event_loop, format!("cannot create window: {e}")),
+        if quake || custom {
+            attrs = attrs.with_decorations(false);
+        }
+        let config = self.render_config();
+        // See-through windows: the GPU image goes straight to the screen
+        // through DirectComposition. Windows' own copy of the window (the
+        // redirection surface) would sit under it and show through as a
+        // gray slab, so leave it out. If the GPU can't present that way,
+        // make the window again the ordinary way.
+        let mut fonts = Some(fonts);
+        let mut made = None;
+        for composited in [true, false] {
+            let attrs = if composited {
+                attrs.clone().with_no_redirection_bitmap(true)
+            } else {
+                attrs.clone().with_transparent(true)
+            }
+            // Shown once we know it is the one we keep.
+            .with_visible(false);
+            let window = match event_loop.create_window(attrs) {
+                Ok(w) => Arc::new(w),
+                Err(e) => return self.fail(event_loop, format!("cannot create window: {e}")),
+            };
+            let fonts = match fonts.take() {
+                Some(f) if window.scale_factor() == scale => f,
+                _ => Fonts::new(&config, window.scale_factor()),
+            };
+            let renderer = match Renderer::new(window.clone(), fonts, &config) {
+                Ok(r) => r,
+                Err(e) => return self.fail(event_loop, e),
+            };
+            if composited && !renderer.uses_composition() {
+                drop(renderer);
+                drop(window);
+                continue;
+            }
+            made = Some((window, renderer));
+            break;
+        }
+        let Some((window, mut renderer)) = made else {
+            return self.fail(event_loop, "cannot create window".to_string());
         };
         if quake {
             place_quake(&window);
         }
-        let config = self.render_config();
-        let fonts = if window.scale_factor() != scale {
-            Fonts::new(&config, window.scale_factor())
-        } else {
-            fonts
-        };
-        let renderer = match Renderer::new(window.clone(), fonts, &config) {
-            Ok(r) => r,
-            Err(e) => return self.fail(event_loop, e),
-        };
+        if custom {
+            window.set_undecorated_shadow(true);
+            renderer.window_buttons = true;
+            renderer.maximized = window.is_maximized();
+        }
+        self.custom_frame = custom;
+        window.set_visible(true);
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.apply_transparency();
@@ -1642,8 +1844,10 @@ impl ApplicationHandler<Wake> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width, size.height);
+                    r.maximized = maximized;
                 }
                 self.fit_all();
             }
@@ -1676,12 +1880,33 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
                     let bare = event.key_without_modifiers();
-                    if let Some(action) = self.bindings.lookup(&bare, self.mods) {
+                    let action = self.bindings.lookup(&bare, self.mods);
+                    if self.settings_open() {
+                        // Only the binding that toggles the page gets past
+                        // it; zooming and full screen are fine too.
+                        match action {
+                            Some(
+                                a @ (Action::OpenSettings
+                                | Action::Fullscreen
+                                | Action::ZoomIn
+                                | Action::ZoomOut
+                                | Action::ZoomReset),
+                            ) => self.run_action(a),
+                            _ => self.settings_key(&event),
+                        }
+                    } else if let Some(action) = action {
                         self.run_action(action);
                     } else if !self.search_key(&event) {
                         self.type_key(&event);
                     }
                 }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.tab_hover = None;
+                if let Some(r) = &mut self.renderer {
+                    r.hover = None;
+                }
+                self.redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);

@@ -6,7 +6,10 @@
 use tacoterm::config::Config;
 use tacoterm::grid::Grid;
 use tacoterm::layout::{Layout, Rect, Split};
-use tacoterm::renderer::{Fonts, Frame, PaneView, Renderer, SearchBar};
+use tacoterm::renderer::{
+    Control, Fonts, Frame, PaneView, Renderer, SearchBar, SettingsPage, SettingsRow, TabHit,
+};
+use tacoterm::settings::{Kind, Settings, PREVIEW_TEXT};
 use tacoterm::vt::Vt;
 
 #[test]
@@ -137,6 +140,7 @@ fn renders_tabs_splits_search_and_box_drawing() {
         }),
         cursor_on: true,
         flash: false,
+        settings: None,
     };
     assert!(renderer.render(&frame));
     let pixels = renderer.read_pixels().unwrap();
@@ -164,6 +168,95 @@ fn renders_tabs_splits_search_and_box_drawing() {
     // ...and the divider between the panes is drawn.
     let d = layout.dividers(area, gap)[0];
     assert_ne!(px(d.x as u32, (d.y + d.h / 2.0) as u32), bg);
+}
+
+#[test]
+fn renders_settings_page_and_window_buttons() {
+    let config = Config {
+        padding: 4,
+        ..Config::default()
+    };
+    let fonts = Fonts::new(&config, 1.0);
+    let (w, h) = (1100u32, 640u32);
+    let mut renderer = match Renderer::headless(w, h, fonts, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    renderer.window_buttons = true;
+    renderer.hover = Some(TabHit::CloseWindow);
+    let bar = renderer.tab_bar_height() as f32;
+    let area = Rect::new(0.0, bar, w as f32, h as f32 - bar);
+
+    let mut model = Settings::new(&config, vec!["Cascadia Mono".into()], Vec::new());
+    model.selected = 1;
+    let rows: Vec<SettingsRow> = model
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| SettingsRow {
+            label: f.label.to_string(),
+            value: model.value_text(i),
+            control: match f.kind {
+                Kind::Choice(_) => Control::Choice,
+                Kind::Number { .. } => Control::Slider(model.fraction(i).unwrap_or(0.0)),
+                Kind::Toggle => Control::Toggle(model.toggle_state(i)),
+            },
+        })
+        .collect();
+    let prect = renderer.settings_preview_rect(area);
+    let (pc, pr) = renderer.pane_grid_size(prect);
+    let mut preview = Grid::new(pc as usize, pr as usize, 0);
+    Vt::new().advance(&mut preview, PREVIEW_TEXT.as_bytes());
+
+    // Clicks find the right controls.
+    let n = rows.len();
+    let page = |rows: Vec<SettingsRow>| SettingsPage {
+        area,
+        rows,
+        selected: 1,
+        scroll: 0,
+        help: model.fields[1].help,
+        preview: &preview,
+        dirty: true,
+        hover: None,
+    };
+    let frame = Frame {
+        panes: Vec::new(),
+        dividers: Vec::new(),
+        tabs: vec!["PowerShell".into()],
+        active_tab: 0,
+        search: None,
+        cursor_on: true,
+        flash: false,
+        settings: Some(page(rows.clone())),
+    };
+    assert!(renderer.render(&frame));
+    let pixels = renderer.read_pixels().unwrap();
+    save_snapshot("TACOTERM_SNAPSHOT_SETTINGS", &pixels, w, h);
+
+    assert_eq!(
+        renderer.tab_hit(w as f64 - 5.0, 5.0, 1),
+        Some(TabHit::CloseWindow)
+    );
+    let mut found_row = false;
+    for y in (bar as u32..h).step_by(4) {
+        if let Some(tacoterm::renderer::SettingsHit::Row(_)) =
+            renderer.settings_hit(area, &rows, 0, 40.0, y as f64)
+        {
+            found_row = true;
+        }
+    }
+    assert!(found_row && n > 5);
+    // The hovered close button is red.
+    let i = ((5 * w + (w - 5)) * 4) as usize;
+    assert!(
+        pixels[i] > 150 && pixels[i + 1] < 90,
+        "{:?}",
+        &pixels[i..i + 3]
+    );
 }
 
 fn save_snapshot(var: &str, pixels: &[u8], w: u32, h: u32) {

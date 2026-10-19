@@ -45,6 +45,9 @@ pub struct Config {
     pub copy_on_select: bool,
     /// `always`, `multiple` (only with two or more tabs) or `never`.
     pub tab_bar: String,
+    /// `custom`: tacoterm draws the title bar into the tab strip, so it is
+    /// see-through like the rest; `system`: the normal Windows one.
+    pub title_bar: String,
     /// Global hotkey that shows/hides tacoterm from anywhere, e.g.
     /// `win+\``; empty disables.
     pub summon_hotkey: String,
@@ -122,6 +125,7 @@ impl Default for Config {
             bell: "visual".to_string(),
             copy_on_select: false,
             tab_bar: "always".to_string(),
+            title_bar: "custom".to_string(),
             summon_hotkey: "win+`".to_string(),
             quake_mode: false,
             color_scheme: "tokyo-night".to_string(),
@@ -430,6 +434,11 @@ impl Config {
         }
     }
 
+    /// Whether tacoterm draws its own title bar.
+    pub fn custom_title_bar(&self) -> bool {
+        !self.title_bar.trim().eq_ignore_ascii_case("system")
+    }
+
     pub fn backdrop(&self) -> Backdrop {
         match self.backdrop.trim().to_lowercase().as_str() {
             "acrylic" | "blur" => Backdrop::Acrylic,
@@ -542,6 +551,9 @@ backdrop = "none"
 bell = "visual"             # visual, sound, both or none
 copy_on_select = false
 tab_bar = "always"          # always, multiple (2+ tabs) or never
+# "custom" draws the title bar into the tab strip (see-through with the
+# rest of the window); "system" keeps the normal Windows one. On restart.
+title_bar = "custom"
 
 # Press this anywhere in Windows to show or hide tacoterm. quake_mode makes
 # it drop down from the top of the screen instead. (Both apply on restart.)
@@ -637,12 +649,23 @@ fn migrate(path: &std::path::Path, text: String) -> String {
 /// Set one top-level `key = value` in the config file, keeping everything
 /// else (comments included). `value` is TOML, e.g. `"\"dracula\""`.
 pub fn set_top_level(key: &str, value: &str) -> std::io::Result<()> {
-    let path = config_path();
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| STARTER_TOML.to_string());
-    std::fs::write(&path, with_top_level(&text, key, value))
+    set_top_levels(&[(key, value.to_string())])
 }
 
-fn with_top_level(text: &str, key: &str, value: &str) -> String {
+/// [`set_top_level`] for several keys in one write.
+pub fn set_top_levels(pairs: &[(&str, String)]) -> std::io::Result<()> {
+    let path = config_path();
+    let mut text = std::fs::read_to_string(&path).unwrap_or_else(|_| STARTER_TOML.to_string());
+    for (key, value) in pairs {
+        text = with_top_level(&text, key, value);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, text)
+}
+
+pub(crate) fn with_top_level(text: &str, key: &str, value: &str) -> String {
     let line = format!("{key} = {value}");
     let mut out = Vec::new();
     let mut done = false;

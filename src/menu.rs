@@ -29,6 +29,7 @@ pub enum Choice {
     Shell(&'static str),
     Fullscreen,
     Settings,
+    EditFile,
 }
 
 /// What the menu shows checked or grayed.
@@ -52,6 +53,7 @@ const PASTE: usize = 7;
 const SELECT_ALL: usize = 8;
 const FULLSCREEN: usize = 9;
 const SETTINGS: usize = 10;
+const EDIT_FILE: usize = 11;
 const SCHEME_BASE: usize = 100;
 const SHELL_BASE: usize = 200;
 const OPACITY_BASE: usize = 300;
@@ -162,7 +164,8 @@ pub fn show(window: &Window, state: &State) -> Option<Choice> {
         );
 
         separator(menu);
-        item(menu, none, SETTINGS, "All settings…\tCtrl+,");
+        item(menu, none, SETTINGS, "Settings…\tCtrl+,");
+        item(menu, none, EDIT_FILE, "Edit config.toml");
 
         let mut at = POINT::default();
         let _ = GetCursorPos(&mut at);
@@ -193,6 +196,7 @@ pub fn show(window: &Window, state: &State) -> Option<Choice> {
             SELECT_ALL => Some(Choice::SelectAll),
             FULLSCREEN => Some(Choice::Fullscreen),
             SETTINGS => Some(Choice::Settings),
+            EDIT_FILE => Some(Choice::EditFile),
             n if in_range(SCHEME_BASE, SCHEMES.len()) => {
                 Some(Choice::Scheme(SCHEMES[n - SCHEME_BASE].name))
             }

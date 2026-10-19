@@ -109,6 +109,20 @@ impl Fonts {
         (self.cell_height as f32 * 1.8).round() as u32
     }
 
+    /// Installed monospace font families, sorted.
+    pub fn monospace_families(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .system
+            .db()
+            .faces()
+            .filter(|f| f.monospaced)
+            .filter_map(|f| f.families.first().map(|(n, _)| n.clone()))
+            .collect();
+        out.sort_by_key(|n| n.to_lowercase());
+        out.dedup();
+        out
+    }
+
     fn shape(&mut self, text: &str, bold: bool, italic: bool) -> Buffer {
         let metrics = Metrics::new(self.size, self.cell_height as f32);
         let mut buf = Buffer::new(&mut self.system, metrics);
@@ -227,9 +241,9 @@ struct GlyphKey {
     c: char,
     bold: bool,
     italic: bool,
-    /// Drawn at a size of its own for the UI (the tab close button), not
-    /// a cell.
-    ui: bool,
+    /// Drawn at this pixel size for the UI (close buttons) rather than at
+    /// cell size; 0 for cells.
+    ui: u16,
 }
 
 struct AtlasFull;
@@ -424,6 +438,66 @@ pub struct Frame<'a> {
     pub cursor_on: bool,
     /// Visual bell.
     pub flash: bool,
+    /// The settings page, drawn instead of the panes.
+    pub settings: Option<SettingsPage<'a>>,
+}
+
+/// How a settings row is edited.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    Choice,
+    /// A slider at this position, 0..=1.
+    Slider(f32),
+    Toggle(bool),
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsRow {
+    pub label: String,
+    pub value: String,
+    pub control: Control,
+}
+
+/// The settings page: a list of settings beside a live preview.
+pub struct SettingsPage<'a> {
+    /// The area below the tab strip, which the page fills.
+    pub area: Rect,
+    pub rows: Vec<SettingsRow>,
+    pub selected: usize,
+    /// First row shown (the list scrolls when it doesn't fit).
+    pub scroll: usize,
+    pub help: &'a str,
+    /// A sample terminal drawn with the settings being edited.
+    pub preview: &'a Grid,
+    /// Unsaved changes: Save lights up.
+    pub dirty: bool,
+    pub hover: Option<SettingsHit>,
+}
+
+/// What a click on the settings page landed on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SettingsHit {
+    Row(usize),
+    Prev(usize),
+    Next(usize),
+    /// A slider, at this position 0..=1.
+    Slider(usize, f32),
+    Save,
+    Cancel,
+    EditFile,
+}
+
+/// Where the settings page puts things.
+struct PageLayout {
+    title: (f32, f32),
+    /// (row index, whole row, prev arrow, value, next arrow)
+    rows: Vec<(usize, Rect, Rect, Rect, Rect)>,
+    help: (f32, f32),
+    save: Rect,
+    cancel: Rect,
+    edit: Rect,
+    preview: Rect,
+    visible: usize,
 }
 
 impl<'a> Frame<'a> {
@@ -444,6 +518,7 @@ impl<'a> Frame<'a> {
             search: None,
             cursor_on: true,
             flash: false,
+            settings: None,
         }
     }
 }
@@ -454,6 +529,30 @@ pub enum TabHit {
     Tab(usize),
     Close(usize),
     New,
+    Settings,
+    Minimize,
+    Maximize,
+    CloseWindow,
+    /// Bare strip: drags the window when the title bar is ours.
+    Empty,
+}
+
+/// The tab strip's pieces.
+struct Strip {
+    /// (tab, its close button)
+    tabs: Vec<(Rect, Rect)>,
+    new: Rect,
+    settings: Rect,
+    /// Minimize, maximize, close, when tacoterm draws the title bar.
+    buttons: Option<[Rect; 3]>,
+}
+
+fn hit_row(h: SettingsHit) -> Option<usize> {
+    match h {
+        SettingsHit::Row(i) | SettingsHit::Prev(i) | SettingsHit::Next(i) => Some(i),
+        SettingsHit::Slider(i, _) => Some(i),
+        _ => None,
+    }
 }
 
 // ---- renderer ----------------------------------------------------------
@@ -495,6 +594,13 @@ pub struct Renderer {
     pub focused: bool,
     alpha_mode: wgpu::CompositeAlphaMode,
     opacity: f32,
+    /// Presenting through DirectComposition (see [`Renderer::new`]).
+    composition: bool,
+    /// Draw minimize/maximize/close in the tab strip (custom title bar).
+    pub window_buttons: bool,
+    pub maximized: bool,
+    /// The strip item under the mouse, highlighted.
+    pub hover: Option<TabHit>,
 }
 
 impl Renderer {
@@ -515,7 +621,7 @@ impl Renderer {
         }
         attempts.push(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let mut last_error = String::new();
-        for desc in attempts {
+        for (attempt, desc) in attempts.into_iter().enumerate() {
             match Self::open_window(window.clone(), desc) {
                 Ok((device, queue, surface, caps)) => {
                     let format = caps
@@ -559,6 +665,7 @@ impl Renderer {
                         scale,
                     );
                     r.alpha_mode = alpha_mode;
+                    r.composition = cfg!(windows) && attempt == 0;
                     return Ok(r);
                 }
                 Err(e) => last_error = e,
@@ -805,6 +912,10 @@ impl Renderer {
             focused: true,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             opacity: config.opacity.clamp(0.0, 1.0),
+            composition: false,
+            window_buttons: false,
+            maximized: false,
+            hover: None,
         }
     }
 
@@ -944,12 +1055,39 @@ impl Renderer {
         self.cell_in(self.full_rect(), x, y, grid)
     }
 
-    /// Tab, close-button and new-tab-button rects for `n` tabs.
-    fn tab_layout(&self, n: usize) -> (Vec<(Rect, Rect)>, Rect) {
+    /// Whether frames go through DirectComposition, which lets the window
+    /// have no GDI surface of its own (see the app's window setup).
+    pub fn uses_composition(&self) -> bool {
+        self.composition
+    }
+
+    /// Installed monospace font families, sorted.
+    pub fn monospace_families(&self) -> Vec<String> {
+        self.fonts.monospace_families()
+    }
+
+    /// The tab strip's layout for `n` tabs.
+    fn strip(&self, n: usize) -> Strip {
         let h = self.tab_bar_height() as f32;
         let cw = self.fonts.cell_width as f32;
+        let w = self.width as f32;
         let n = n.max(1);
-        let room = (self.width as f32 - h - 8.0).max(cw * 4.0);
+        let button_w = (h * 1.45).round();
+        let buttons = self.window_buttons.then(|| {
+            [3.0, 2.0, 1.0].map(|k| Rect {
+                x: w - k * button_w,
+                y: 0.0,
+                w: button_w,
+                h,
+            })
+        });
+        let right = if buttons.is_some() {
+            // Keep some bare strip to drag the window by.
+            3.0 * button_w + cw * 6.0
+        } else {
+            0.0
+        };
+        let room = (w - right - 2.0 * h).max(cw * 4.0);
         let tab_w = (room / n as f32).clamp(cw * 6.0, cw * 28.0).floor();
         let close = (h * 0.55).round();
         let tabs = (0..n)
@@ -975,20 +1113,48 @@ impl Renderer {
             w: h,
             h,
         };
-        (tabs, new)
+        let settings = Rect {
+            x: match buttons {
+                Some(b) => b[0].x - h,
+                None => w - h,
+            },
+            y: 0.0,
+            w: h,
+            h,
+        };
+        Strip {
+            tabs,
+            new,
+            settings,
+            buttons,
+        }
     }
 
-    /// What's under a click in the tab strip.
+    /// What's under a point in the tab strip.
     pub fn tab_hit(&self, x: f64, y: f64, n: usize) -> Option<TabHit> {
         let (x, y) = (x as f32, y as f32);
-        if y >= self.tab_bar_height() as f32 {
+        if y >= self.tab_bar_height() as f32 || y < 0.0 {
             return None;
         }
-        let (tabs, new) = self.tab_layout(n);
-        if new.contains(x, y) {
+        let strip = self.strip(n);
+        if let Some([min, max, close]) = strip.buttons {
+            if min.contains(x, y) {
+                return Some(TabHit::Minimize);
+            }
+            if max.contains(x, y) {
+                return Some(TabHit::Maximize);
+            }
+            if close.contains(x, y) {
+                return Some(TabHit::CloseWindow);
+            }
+        }
+        if strip.settings.contains(x, y) {
+            return Some(TabHit::Settings);
+        }
+        if strip.new.contains(x, y) {
             return Some(TabHit::New);
         }
-        tabs.iter().enumerate().find_map(|(i, (tab, close))| {
+        let tab = strip.tabs.iter().enumerate().find_map(|(i, (tab, close))| {
             if close.contains(x, y) && n > 1 {
                 Some(TabHit::Close(i))
             } else if tab.contains(x, y) {
@@ -996,7 +1162,8 @@ impl Renderer {
             } else {
                 None
             }
-        })
+        });
+        Some(tab.unwrap_or(TabHit::Empty))
     }
 
     fn color(&self, rgb: Rgb, alpha: f32) -> [f32; 4] {
@@ -1142,7 +1309,7 @@ impl Renderer {
                     c,
                     bold: false,
                     italic: false,
-                    ui: false,
+                    ui: 0,
                 };
                 if let Some(g) = self.glyph(key)? {
                     out.push(Self::glyph_instance(g, x + col as f32 * cw, y, color));
@@ -1158,6 +1325,9 @@ impl Renderer {
     /// overlays (dimming, search box, bell flash).
     fn build_instances(&mut self, frame: &Frame) -> Result<Vec<Instance>, AtlasFull> {
         let mut layers = Layers::default();
+        if let Some(page) = &frame.settings {
+            self.build_settings(&mut layers, page, frame.cursor_on)?;
+        }
         let multi = frame.panes.len() > 1;
         for pane in &frame.panes {
             self.build_pane(&mut layers, pane, frame.cursor_on)?;
@@ -1291,7 +1461,7 @@ impl Renderer {
                         c: cell.c,
                         bold,
                         italic: cell.attr.has(Attr::ITALIC),
-                        ui: false,
+                        ui: 0,
                     };
                     if let Some(g) = self.glyph(key)? {
                         layers
@@ -1338,15 +1508,26 @@ impl Renderer {
         } else {
             mix(bg, (0, 0, 0), 0.08)
         };
-        let (tabs, new) = self.tab_layout(frame.tabs.len());
+        let strip = self.strip(frame.tabs.len());
         let h = self.tab_bar_height() as f32;
         let (_, ch) = self.cell_size();
         let text_y = ((h - ch as f32) / 2.0).round();
         let cw = self.fonts.cell_width as f32;
         // The strip, minus the active tab, which shows the pane background
-        // so it reads as attached to the terminal below.
-        let active = tabs.get(frame.active_tab).map(|t| t.0);
+        // so it reads as attached to the terminal below. With the settings
+        // page up no tab is "attached".
+        let active = if frame.settings.is_some() {
+            None
+        } else {
+            strip.tabs.get(frame.active_tab).map(|t| t.0)
+        };
         let bar_color = self.color(bar, alpha);
+        let full = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: self.width as f32,
+            h,
+        };
         match active {
             Some(a) => {
                 layers
@@ -1361,37 +1542,36 @@ impl Renderer {
                     bar_color,
                 ));
             }
-            None => layers.backgrounds.push(rect(
-                Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: self.width as f32,
-                    h,
-                },
-                bar_color,
-            )),
+            None => layers.backgrounds.push(rect(full, bar_color)),
         }
         let fg = self.colors.foreground;
         let dim = mix(fg, bar, 0.45);
         let accent = self.color(self.colors.palette[4], 1.0);
-        for (i, (title, (tab, close))) in frame.tabs.iter().zip(&tabs).enumerate() {
-            let is_active = i == frame.active_tab;
+        let hover_bg = self.color(fg, 0.1);
+        let hover = self.hover;
+        for (i, (title, (tab, close))) in frame.tabs.iter().zip(&strip.tabs).enumerate() {
+            let is_active = Some(*tab) == active;
             let color = self.color(if is_active { fg } else { dim }, 1.0);
             if is_active {
                 let line = (2.0 * self.scale as f32).round();
                 layers
                     .decorations
                     .push(Instance::rect(tab.x, 0.0, tab.w, line, accent));
-            } else if i + 1 != frame.active_tab && i + 1 < tabs.len() {
-                // Separator between two inactive tabs.
-                let sep = self.color(dim, 0.5);
-                layers.decorations.push(Instance::rect(
-                    tab.x + tab.w - 1.0,
-                    h * 0.25,
-                    1.0,
-                    h * 0.5,
-                    sep,
-                ));
+            } else {
+                if hover == Some(TabHit::Tab(i)) || hover == Some(TabHit::Close(i)) {
+                    layers.backgrounds.push(rect(*tab, hover_bg));
+                }
+                if i + 1 != frame.active_tab && i + 1 < strip.tabs.len() {
+                    // Separator between two inactive tabs.
+                    let sep = self.color(dim, 0.5);
+                    layers.decorations.push(Instance::rect(
+                        tab.x + tab.w - 1.0,
+                        h * 0.25,
+                        1.0,
+                        h * 0.5,
+                        sep,
+                    ));
+                }
             }
             let max_w = close.x - tab.x - cw * 1.5;
             self.text(
@@ -1401,15 +1581,21 @@ impl Renderer {
                 color,
                 max_w,
             )?;
-            if tabs.len() > 1 {
-                self.cross(layers, *close, color);
+            if strip.tabs.len() > 1 {
+                if hover == Some(TabHit::Close(i)) {
+                    layers.backgrounds.push(rect(*close, hover_bg));
+                }
+                self.cross(layers, *close, (close.w * 0.5).round(), color);
             }
         }
-        // "+" for a new tab.
         let c = self.color(dim, 1.0);
         let t = self.line_px().max(1.0) + (self.scale as f32 - 1.0).max(0.0);
+        // "+" for a new tab.
+        if hover == Some(TabHit::New) {
+            layers.backgrounds.push(rect(strip.new, hover_bg));
+        }
         let arm = (h * 0.3).round();
-        let (cx, cy) = (new.x + new.w / 2.0, new.y + new.h / 2.0);
+        let (cx, cy) = (strip.new.x + strip.new.w / 2.0, h / 2.0);
         layers.decorations.push(Instance::rect(
             (cx - arm / 2.0).round(),
             (cy - t / 2.0).round(),
@@ -1424,17 +1610,84 @@ impl Renderer {
             arm,
             c,
         ));
+        // Settings gear.
+        let s = strip.settings;
+        if hover == Some(TabHit::Settings) || frame.settings.is_some() {
+            layers.backgrounds.push(rect(s, hover_bg));
+        }
+        let gear_color = self.color(if frame.settings.is_some() { fg } else { dim }, 1.0);
+        self.text(
+            &mut layers.glyphs,
+            ((s.x + (s.w - cw) / 2.0).round(), text_y),
+            "⚙",
+            gear_color,
+            cw * 2.0,
+        )?;
+        // Window buttons, Windows-style: a wide hover, red for close.
+        if let Some([min, max, close]) = strip.buttons {
+            let size = (10.0 * self.scale as f32).round();
+            let icon = self.color(fg, 1.0);
+            for (r, hit) in [
+                (min, TabHit::Minimize),
+                (max, TabHit::Maximize),
+                (close, TabHit::CloseWindow),
+            ] {
+                if hover == Some(hit) {
+                    let hl = if hit == TabHit::CloseWindow {
+                        [0.77, 0.17, 0.11, 1.0]
+                    } else {
+                        hover_bg
+                    };
+                    layers.backgrounds.push(rect(r, hl));
+                }
+            }
+            let (mx, my) = ((min.x + (min.w - size) / 2.0).round(), (h / 2.0).round());
+            layers
+                .decorations
+                .push(Instance::rect(mx, my, size, t, icon));
+            let (bx, by) = (
+                (max.x + (max.w - size) / 2.0).round(),
+                ((h - size) / 2.0).round(),
+            );
+            let square = |x: f32, y: f32, s: f32, d: &mut Vec<Instance>| {
+                d.push(Instance::rect(x, y, s, t, icon));
+                d.push(Instance::rect(x, y + s - t, s, t, icon));
+                d.push(Instance::rect(x, y, t, s, icon));
+                d.push(Instance::rect(x + s - t, y, t, s, icon));
+            };
+            if self.maximized {
+                // Two overlapping windows: "restore".
+                let off = (2.0 * self.scale as f32).round();
+                let small = size - off;
+                square(bx, by + off, small, &mut layers.decorations);
+                layers
+                    .decorations
+                    .push(Instance::rect(bx + off, by, small, t, icon));
+                layers
+                    .decorations
+                    .push(Instance::rect(bx + size - t, by, t, small, icon));
+            } else {
+                square(bx, by, size, &mut layers.decorations);
+            }
+            let x_color = if hover == Some(TabHit::CloseWindow) {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                icon
+            };
+            self.cross(layers, close, size, x_color);
+        }
         Ok(())
     }
 
-    /// A small × centered in `r`, drawn with the box-drawing diagonal.
-    fn cross(&mut self, layers: &mut Layers, r: Rect, color: [f32; 4]) {
-        let size = (r.w * 0.5).round().max(4.0) as u32;
+    /// A × of `size` pixels centered in `r`, drawn with the box-drawing
+    /// diagonal.
+    fn cross(&mut self, layers: &mut Layers, r: Rect, size: f32, color: [f32; 4]) {
+        let size = size.max(4.0) as u32;
         let key = GlyphKey {
             c: '\u{2573}',
             bold: false,
             italic: false,
-            ui: true,
+            ui: size as u16,
         };
         if let Some(g) = self.cached_cross(key, size) {
             let x = (r.x + (r.w - size as f32) / 2.0).round();
@@ -1476,6 +1729,400 @@ impl Renderer {
         };
         self.glyphs.insert(key, Some(g));
         Some(g)
+    }
+
+    // ---- settings page --------------------------------------------------
+
+    fn page_layout(&self, area: Rect, rows: usize, scroll: usize) -> PageLayout {
+        let (cw, ch) = self.cell_size();
+        let (cw, ch) = (cw as f32, ch as f32);
+        let margin = 2.0 * cw;
+        let rh = (ch * 1.7).round();
+        let x0 = area.x + margin;
+        let title = (x0, area.y + ch);
+        let list_top = area.y + ch * 3.0;
+        let bottom = area.y + area.h - margin * 0.5;
+        let buttons_y = bottom - rh;
+        let help = (x0, buttons_y - ch * 1.6);
+        let list_w = 46.0 * cw;
+        let side_by_side = area.w >= list_w + 40.0 * cw;
+        let list_bottom_full = help.1 - ch * 0.5;
+        let (list_bottom, preview) = if side_by_side {
+            let x = x0 + list_w + margin;
+            (
+                list_bottom_full,
+                Rect {
+                    x,
+                    y: list_top + ch * 1.5,
+                    w: (area.x + area.w - margin - x).max(cw),
+                    h: (list_bottom_full - list_top - ch * 1.5).max(ch),
+                },
+            )
+        } else {
+            let ph = ((list_bottom_full - list_top) * 0.45).max(ch * 4.0);
+            let y = list_bottom_full - ph;
+            (
+                y - ch * 2.0,
+                Rect {
+                    x: x0,
+                    y,
+                    w: (area.w - 2.0 * margin).max(cw),
+                    h: ph,
+                },
+            )
+        };
+        let visible = (((list_bottom - list_top) / rh).floor().max(1.0)) as usize;
+        let label_w = 18.0 * cw;
+        let control_w = list_w - label_w - margin;
+        let arrow = 2.5 * cw;
+        let rows = (scroll..rows.min(scroll + visible))
+            .enumerate()
+            .map(|(k, i)| {
+                let y = list_top + k as f32 * rh;
+                let row = Rect {
+                    x: x0 - cw,
+                    y,
+                    w: list_w,
+                    h: rh,
+                };
+                let cx = x0 + label_w;
+                let prev = Rect {
+                    x: cx,
+                    y,
+                    w: arrow,
+                    h: rh,
+                };
+                let next = Rect {
+                    x: cx + control_w - arrow,
+                    y,
+                    w: arrow,
+                    h: rh,
+                };
+                let value = Rect {
+                    x: cx + arrow,
+                    y,
+                    w: control_w - 2.0 * arrow,
+                    h: rh,
+                };
+                (i, row, prev, value, next)
+            })
+            .collect();
+        let button = |x: f32, cols: f32| Rect {
+            x,
+            y: buttons_y,
+            w: cols * cw,
+            h: rh,
+        };
+        let save = button(x0, 8.0);
+        let cancel = button(save.x + save.w + cw, 8.0);
+        let edit = button(cancel.x + cancel.w + cw, 13.0);
+        PageLayout {
+            title,
+            rows,
+            help,
+            save,
+            cancel,
+            edit,
+            preview,
+            visible,
+        }
+    }
+
+    /// How many settings rows fit in `area`.
+    pub fn settings_visible_rows(&self, area: Rect) -> usize {
+        self.page_layout(area, 0, 0).visible
+    }
+
+    /// Where the preview terminal goes (its grid should fit it).
+    pub fn settings_preview_rect(&self, area: Rect) -> Rect {
+        self.page_layout(area, 0, 0).preview
+    }
+
+    /// What's under a point on the settings page.
+    pub fn settings_hit(
+        &self,
+        area: Rect,
+        rows: &[SettingsRow],
+        scroll: usize,
+        x: f64,
+        y: f64,
+    ) -> Option<SettingsHit> {
+        let (x, y) = (x as f32, y as f32);
+        let l = self.page_layout(area, rows.len(), scroll);
+        if l.save.contains(x, y) {
+            return Some(SettingsHit::Save);
+        }
+        if l.cancel.contains(x, y) {
+            return Some(SettingsHit::Cancel);
+        }
+        if l.edit.contains(x, y) {
+            return Some(SettingsHit::EditFile);
+        }
+        for (i, row, prev, value, next) in l.rows {
+            if !row.contains(x, y) {
+                continue;
+            }
+            if let Control::Slider(_) = rows[i].control {
+                let track = self.slider_track(prev, value, next);
+                if x >= track.x - 4.0 && x <= track.x + track.w + 4.0 {
+                    let t = ((x - track.x) / track.w).clamp(0.0, 1.0);
+                    return Some(SettingsHit::Slider(i, t));
+                }
+            }
+            if prev.contains(x, y) {
+                return Some(SettingsHit::Prev(i));
+            }
+            if next.contains(x, y) || value.contains(x, y) {
+                return Some(SettingsHit::Next(i));
+            }
+            return Some(SettingsHit::Row(i));
+        }
+        None
+    }
+
+    /// Where along row `i`'s slider the mouse's `x` falls, for dragging
+    /// once the mouse has left the row.
+    pub fn settings_slider_at(
+        &self,
+        area: Rect,
+        rows: &[SettingsRow],
+        scroll: usize,
+        i: usize,
+        x: f64,
+    ) -> Option<f32> {
+        let l = self.page_layout(area, rows.len(), scroll);
+        let (_, _, prev, value, next) = l.rows.into_iter().find(|r| r.0 == i)?;
+        let track = self.slider_track(prev, value, next);
+        Some(((x as f32 - track.x) / track.w).clamp(0.0, 1.0))
+    }
+
+    /// A slider's track: the whole control minus room for its value.
+    fn slider_track(&self, prev: Rect, _value: Rect, next: Rect) -> Rect {
+        let cw = self.fonts.cell_width as f32;
+        let x = prev.x + cw * 0.5;
+        Rect {
+            x,
+            y: prev.y + prev.h / 2.0,
+            w: (next.x + next.w - 7.0 * cw - x).max(cw),
+            h: 0.0,
+        }
+    }
+
+    fn build_settings(
+        &mut self,
+        layers: &mut Layers,
+        page: &SettingsPage,
+        cursor_on: bool,
+    ) -> Result<(), AtlasFull> {
+        let area = page.area;
+        let l = self.page_layout(area, page.rows.len(), page.scroll);
+        let (cw, ch) = self.cell_size();
+        let (cw, ch) = (cw as f32, ch as f32);
+        let fg = self.colors.foreground;
+        let bg = self.colors.background;
+        let fg_c = self.color(fg, 1.0);
+        let dim = self.color(mix(fg, bg, 0.45), 1.0);
+        let accent_rgb = self.colors.palette[4];
+        let accent = self.color(accent_rgb, 1.0);
+        let faint = self.color(fg, 0.07);
+        let line = self.line_px();
+        let text_dy = |r: Rect| (r.y + (r.h - ch) / 2.0).round();
+
+        let w = self.text(&mut layers.glyphs, l.title, "Settings", fg_c, 20.0 * cw)?;
+        self.text(
+            &mut layers.glyphs,
+            (l.title.0 + w + 2.0 * cw, l.title.1),
+            "changes show right away · Save keeps them",
+            dim,
+            60.0 * cw,
+        )?;
+
+        for (i, row, prev, value, next) in &l.rows {
+            let r = &page.rows[*i];
+            let selected = *i == page.selected;
+            if selected {
+                layers
+                    .backgrounds
+                    .push(rect(*row, self.color(self.colors.selection, 0.55)));
+                layers.decorations.push(Instance::rect(
+                    row.x,
+                    row.y,
+                    (line * 2.0).max(2.0),
+                    row.h,
+                    accent,
+                ));
+            } else if page.hover.is_some_and(|h| hit_row(h) == Some(*i)) {
+                layers.backgrounds.push(rect(*row, faint));
+            }
+            let ty = text_dy(*row);
+            self.text(
+                &mut layers.glyphs,
+                (row.x + cw, ty),
+                &r.label,
+                if selected { fg_c } else { dim },
+                17.0 * cw,
+            )?;
+            match r.control {
+                Control::Choice => {
+                    let pill = Rect {
+                        x: prev.x,
+                        y: row.y + row.h * 0.15,
+                        w: next.x + next.w - prev.x,
+                        h: row.h * 0.7,
+                    };
+                    layers.backgrounds.push(rect(pill, faint));
+                    let arrow = |h: SettingsHit| {
+                        if page.hover == Some(h) {
+                            fg_c
+                        } else {
+                            dim
+                        }
+                    };
+                    self.text(
+                        &mut layers.glyphs,
+                        (prev.x + cw * 0.75, ty),
+                        "‹",
+                        arrow(SettingsHit::Prev(*i)),
+                        cw * 2.0,
+                    )?;
+                    self.text(
+                        &mut layers.glyphs,
+                        (next.x + cw * 0.75, ty),
+                        "›",
+                        arrow(SettingsHit::Next(*i)),
+                        cw * 2.0,
+                    )?;
+                    let cols = unicode_width::UnicodeWidthStr::width(r.value.as_str()) as f32;
+                    let x = value.x + ((value.w - cols * cw) / 2.0).max(0.0);
+                    self.text(&mut layers.glyphs, (x.round(), ty), &r.value, fg_c, value.w)?;
+                }
+                Control::Slider(t) => {
+                    let track = self.slider_track(*prev, *value, *next);
+                    let th = (line * 2.0).max(2.0);
+                    let ty_track = (track.y - th / 2.0).round();
+                    layers.backgrounds.push(Instance::rect(
+                        track.x,
+                        ty_track,
+                        track.w,
+                        th,
+                        self.color(fg, 0.2),
+                    ));
+                    let filled = (track.w * t).round();
+                    layers
+                        .backgrounds
+                        .push(Instance::rect(track.x, ty_track, filled, th, accent));
+                    let knob = (ch * 0.7).round();
+                    layers.decorations.push(Instance::rect(
+                        (track.x + filled - knob / 2.0).round(),
+                        (track.y - knob / 2.0).round(),
+                        knob,
+                        knob,
+                        fg_c,
+                    ));
+                    self.text(
+                        &mut layers.glyphs,
+                        (track.x + track.w + 1.5 * cw, ty),
+                        &r.value,
+                        fg_c,
+                        6.0 * cw,
+                    )?;
+                }
+                Control::Toggle(on) => {
+                    let pw = 3.5 * cw;
+                    let ph = (ch * 0.75).round();
+                    let px = prev.x;
+                    let py = (row.y + (row.h - ph) / 2.0).round();
+                    let track = if on { accent } else { self.color(fg, 0.25) };
+                    layers
+                        .backgrounds
+                        .push(Instance::rect(px, py, pw, ph, track));
+                    let k = ph - 2.0 * line.max(2.0);
+                    let kx = if on {
+                        px + pw - k - line.max(2.0)
+                    } else {
+                        px + line.max(2.0)
+                    };
+                    layers
+                        .decorations
+                        .push(Instance::rect(kx, py + line.max(2.0), k, k, fg_c));
+                    self.text(
+                        &mut layers.glyphs,
+                        (px + pw + cw, ty),
+                        &r.value,
+                        fg_c,
+                        6.0 * cw,
+                    )?;
+                }
+            }
+        }
+        // More rows than fit: a hint at the scroll.
+        if page.scroll > 0 || page.scroll + l.visible < page.rows.len() {
+            let more = format!(
+                "{}–{} of {}  (scroll or ↑↓)",
+                page.scroll + 1,
+                (page.scroll + l.visible).min(page.rows.len()),
+                page.rows.len()
+            );
+            let y = l.rows.last().map_or(l.help.1, |r| r.1.y + r.1.h);
+            self.text(&mut layers.glyphs, (l.help.0, y), &more, dim, 40.0 * cw)?;
+        }
+
+        self.text(
+            &mut layers.glyphs,
+            l.help,
+            page.help,
+            dim,
+            area.w - 4.0 * cw,
+        )?;
+
+        for (r, label, hit, primary) in [
+            (l.save, "Save", SettingsHit::Save, page.dirty),
+            (l.cancel, "Cancel", SettingsHit::Cancel, false),
+            (l.edit, "Edit file…", SettingsHit::EditFile, false),
+        ] {
+            let hovered = page.hover == Some(hit);
+            let fill = match (primary, hovered) {
+                (true, true) => self.color(mix(accent_rgb, fg, 0.2), 1.0),
+                (true, false) => accent,
+                (false, true) => self.color(fg, 0.14),
+                (false, false) => faint,
+            };
+            layers.backgrounds.push(rect(r, fill));
+            let text = if primary { self.color(bg, 1.0) } else { fg_c };
+            let cols = label.chars().count() as f32;
+            self.text(
+                &mut layers.glyphs,
+                ((r.x + (r.w - cols * cw) / 2.0).round(), text_dy(r)),
+                label,
+                text,
+                r.w,
+            )?;
+        }
+
+        // The preview: a sample terminal in the edited settings.
+        let p = l.preview;
+        self.text(
+            &mut layers.glyphs,
+            (p.x, p.y - ch * 1.4),
+            "Preview",
+            dim,
+            20.0 * cw,
+        )?;
+        let border = self.color(self.colors.palette[8], 1.0);
+        let d = &mut layers.decorations;
+        d.push(Instance::rect(p.x, p.y, p.w, line, border));
+        d.push(Instance::rect(p.x, p.y + p.h - line, p.w, line, border));
+        d.push(Instance::rect(p.x, p.y, line, p.h, border));
+        d.push(Instance::rect(p.x + p.w - line, p.y, line, p.h, border));
+        let view = PaneView {
+            grid: page.preview,
+            rect: p,
+            focused: true,
+            matches: &[],
+            current_match: None,
+            link: None,
+        };
+        self.build_pane(layers, &view, cursor_on)
     }
 
     fn build_search_bar(

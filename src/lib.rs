@@ -13,4 +13,5 @@ pub mod layout;
 pub mod mouse;
 pub mod renderer;
 pub mod schemes;
+pub mod settings;
 pub mod vt;

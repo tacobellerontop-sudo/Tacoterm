@@ -14,8 +14,12 @@ Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on t
   Ctrl+Shift+Tab switch, click the tab strip, middle-click or × closes
 - **Split panes**: Alt+Shift+= splits right, Alt+Shift+- splits down,
   Alt+arrows move between panes, Alt+Shift+arrows resize, Ctrl+Shift+W closes
-- **Transparency**: `opacity` plus Windows 11 acrylic / mica backgrounds
-  (right-click → Opacity / Background effect)
+- **Transparency**: the whole window, title bar included, with `opacity`
+  plus Windows 11 acrylic / mica backgrounds. tacoterm draws its own title
+  bar into the tab strip (drag it, double-click to maximize, snap works);
+  `title_bar = "system"` brings back the Windows one
+- **Settings page**: the ⚙ in the title bar or Ctrl+, opens every setting
+  beside a live preview
 - **Find in scrollback**: Ctrl+Shift+F; Enter / Shift+Enter step through hits
 - **Links**: Ctrl+click a URL to open it (it underlines while Ctrl is held)
 - **Mouse**: drag, double-click a word, triple-click a line, Shift+click
@@ -46,17 +50,24 @@ parser, renderer, config, key mapping) is a portable library, so
 `cargo test` runs anywhere; the render test draws a frame offscreen and
 checks its pixels (it skips when no GPU adapter, not even a software one,
 is available). `TACOTERM_SNAPSHOT=frame.png cargo test --test render` saves
-that frame (`TACOTERM_SNAPSHOT_TABS` saves the tabs-and-splits one).
+that frame (`TACOTERM_SNAPSHOT_TABS` saves the tabs-and-splits one,
+`TACOTERM_SNAPSHOT_SETTINGS` the settings page).
 
 ## Settings
 
+Click the **⚙** in the title bar (or press Ctrl+, or right-click →
+Settings…) for the settings page: every option in a list, with a preview
+terminal beside it. Changes show on the whole window as you make them;
+**Save** (Ctrl+S) keeps them, **Cancel** (Esc) puts things back. Use the
+arrow keys or the mouse: ‹ › cycle a choice, drag a slider, click a toggle.
+
 **Right-click** anywhere in tacoterm for tabs, splits, find, copy/paste,
 the color scheme, opacity, background effect, the shell (PowerShell,
-Command Prompt, WSL), full screen and **All settings…**, which opens
-`%APPDATA%\tacoterm\config.toml` in Notepad (so does Ctrl+,). Save that
-file and colors, fonts, cursor and keybindings apply right away; shell and
-prompt apply to the next shell. Every key is optional, and a mistake shows
-a warning and falls back to the default.
+Command Prompt, WSL), full screen, the settings page and **Edit
+config.toml**, which opens `%APPDATA%\tacoterm\config.toml` in Notepad.
+Save that file and colors, fonts, cursor and keybindings apply right away;
+shell and prompt apply to the next shell. Every key is optional, and a
+mistake shows a warning and falls back to the default.
 
 ```toml
 # tokyo-night, catppuccin-mocha, dracula, one-half-dark, gruvbox-dark,
@@ -72,6 +83,7 @@ backdrop = "acrylic"             # none, acrylic, mica or tabbed (Windows 11)
 shell = "auto"                   # PowerShell; or "cmd.exe", "wsl.exe ~", …
 prompt = "arrow"                 # path + ❯; "classic" = the shell's own
 right_click = "menu"             # or "paste", like the old console
+title_bar = "custom"             # see-through; "system" = the Windows one
 
 [theme]                          # override single colors of the scheme
 background = "#101010"
@@ -92,6 +104,7 @@ The file tacoterm writes on first run lists every key and binding.
 | --- | --- |
 | `src/main.rs` | Entry point (Windows binary) |
 | `src/app.rs` | winit event loop, tabs and panes, mouse/keyboard, find |
+| `src/app/page.rs` | The settings page: input and live preview |
 | `src/menu.rs` | The right-click menu |
 | `src/win.rs` | Win32 bits: summon hotkey, backdrop, links, beep |
 | `src/pty.rs` | ConPTY wrapper: spawn, resize, write, exit watch |
@@ -104,6 +117,7 @@ The file tacoterm writes on first run lists every key and binding.
 | `src/boxdraw.rs` | Pixel-exact box-drawing and block glyphs |
 | `src/renderer.rs` | wgpu renderer: panes, tab strip, find box, glyph atlas |
 | `src/config.rs` | TOML settings, written on first run |
+| `src/settings.rs` | What the settings page lists and how each value steps |
 | `src/schemes.rs` | Built-in color schemes |
 
 ## Roadmap
@@ -111,6 +125,7 @@ The file tacoterm writes on first run lists every key and binding.
 - [x] ConPTY, VT parsing, grid, scrollback, alternate screen
 - [x] GPU renderer, box drawing, transparency
 - [x] Tabs, splits, find, links, mouse reporting, reflow, quake mode
+- [x] See-through title bar, settings page with live preview
 - [ ] Per-row damage tracking, OSC 8 hyperlinks, dragging pane dividers
 - [ ] A shell of our own
 
