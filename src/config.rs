@@ -1,11 +1,14 @@
-//! TOML config: font, theme, keybindings, default shell.
+//! TOML config: font, color scheme, cursor, prompt, keybindings, shell.
 //!
 //! Written to %APPDATA%\tacoterm\config.toml on first run (like slowshell:
 //! the starter is written once and never rewritten, so your file is yours).
-//! Every key is optional; anything missing takes its default.
+//! Every key is optional; anything missing takes its default. The app
+//! watches the file and applies most changes as soon as it is saved.
 
 use serde::Deserialize;
 use std::path::PathBuf;
+
+use crate::schemes;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -19,18 +22,27 @@ pub struct Config {
     pub scrollback_lines: usize,
     /// Command line to run, e.g. `pwsh.exe -NoLogo` or `wsl.exe ~`.
     pub shell: String,
-    pub theme: Theme,
+    /// cmd.exe prompt, in `PROMPT` syntax (`$P` path, `$G` `>`, `$E` ESC,
+    /// `$_` newline). Empty keeps cmd's own. Ignored by other shells.
+    pub prompt: String,
+    /// `block`, `bar` or `underline`.
+    pub cursor_style: String,
+    /// One of the built-in schemes in [`crate::schemes`].
+    pub color_scheme: String,
+    /// Per-color overrides on top of the scheme.
+    pub theme: ThemeOverrides,
     pub keybindings: Keybindings,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Each color is optional: unset ones come from `color_scheme`.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct Theme {
-    pub background: String,
-    pub foreground: String,
-    pub cursor: String,
-    pub selection: String,
-    /// 16 ANSI colors as #rrggbb: 0-7 normal, 8-15 bright.
+pub struct ThemeOverrides {
+    pub background: Option<String>,
+    pub foreground: Option<String>,
+    pub cursor: Option<String>,
+    pub selection: Option<String>,
+    /// Up to 16 ANSI colors as #rrggbb: 0-7 normal, 8-15 bright.
     pub palette: Vec<String>,
 }
 
@@ -44,6 +56,8 @@ pub struct Keybindings {
     pub scroll_page_down: String,
     pub scroll_to_top: String,
     pub scroll_to_bottom: String,
+    pub next_color_scheme: String,
+    pub open_settings: String,
 }
 
 impl Default for Config {
@@ -51,31 +65,15 @@ impl Default for Config {
         Config {
             font_family: "Cascadia Mono".to_string(),
             font_size: 14.0,
-            line_height: 1.2,
-            padding: 4,
+            line_height: 1.25,
+            padding: 10,
             scrollback_lines: 10_000,
             shell: "C:\\Windows\\System32\\cmd.exe".to_string(),
-            theme: Theme::default(),
+            prompt: DEFAULT_PROMPT.to_string(),
+            cursor_style: "block".to_string(),
+            color_scheme: "tokyo-night".to_string(),
+            theme: ThemeOverrides::default(),
             keybindings: Keybindings::default(),
-        }
-    }
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme {
-            background: "#0c0c0c".to_string(),
-            foreground: "#cccccc".to_string(),
-            cursor: "#cccccc".to_string(),
-            selection: "#264f78".to_string(),
-            palette: [
-                "#0c0c0c", "#c50f1f", "#13a10e", "#c19c00", "#0037da", "#881798", "#3a96dd",
-                "#cccccc", "#767676", "#e74856", "#16c60c", "#f9f1a5", "#3b78ff", "#b4009e",
-                "#61d6d6", "#f2f2f2",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
         }
     }
 }
@@ -89,7 +87,106 @@ impl Default for Keybindings {
             scroll_page_down: "shift+pagedown".to_string(),
             scroll_to_top: "ctrl+shift+home".to_string(),
             scroll_to_bottom: "ctrl+shift+end".to_string(),
+            next_color_scheme: "ctrl+shift+t".to_string(),
+            open_settings: "ctrl+,".to_string(),
         }
+    }
+}
+
+/// Blue path, green arrow; uses palette colors so it follows the scheme.
+pub const DEFAULT_PROMPT: &str = "$E[1;34m$P$E[0m $E[32m❯$E[0m ";
+
+pub type Rgb = (u8, u8, u8);
+
+/// The colors to draw with: the scheme plus overrides, all parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Theme {
+    pub background: Rgb,
+    pub foreground: Rgb,
+    pub cursor: Rgb,
+    pub selection: Rgb,
+    pub palette: [Rgb; 16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStyle {
+    Block,
+    Bar,
+    Underline,
+}
+
+impl Config {
+    /// Resolve `color_scheme` + `[theme]` overrides. Problems (unknown
+    /// scheme, bad colors) fall back to the scheme's color and are reported.
+    pub fn theme(&self) -> (Theme, Vec<String>) {
+        let mut warnings = Vec::new();
+        let scheme = schemes::find(&self.color_scheme).unwrap_or_else(|| {
+            warnings.push(format!(
+                "unknown color_scheme \"{}\"; built-in schemes: {}",
+                self.color_scheme,
+                schemes::names()
+            ));
+            &schemes::SCHEMES[0]
+        });
+        let mut pick = |key: &str, over: Option<&String>, base: &str| -> Rgb {
+            if let Some(s) = over {
+                match parse_hex(s) {
+                    Some(c) => return c,
+                    None => warnings.push(format!("theme.{key}: \"{s}\" is not a #rrggbb color")),
+                }
+            }
+            parse_hex(base).unwrap_or((0, 0, 0))
+        };
+        let background = pick(
+            "background",
+            self.theme.background.as_ref(),
+            scheme.background,
+        );
+        let foreground = pick(
+            "foreground",
+            self.theme.foreground.as_ref(),
+            scheme.foreground,
+        );
+        let cursor = pick("cursor", self.theme.cursor.as_ref(), scheme.cursor);
+        let selection = pick("selection", self.theme.selection.as_ref(), scheme.selection);
+        let mut palette = [(0, 0, 0); 16];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = pick("palette", self.theme.palette.get(i), scheme.palette[i]);
+        }
+        (
+            Theme {
+                background,
+                foreground,
+                cursor,
+                selection,
+                palette,
+            },
+            warnings,
+        )
+    }
+
+    pub fn cursor_style(&self) -> CursorStyle {
+        match self.cursor_style.trim().to_lowercase().as_str() {
+            "bar" | "beam" | "line" => CursorStyle::Bar,
+            "underline" | "underscore" => CursorStyle::Underline,
+            _ => CursorStyle::Block,
+        }
+    }
+
+    /// Everything wrong with this config that parsing alone doesn't catch.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = self.theme().1;
+        let style = self.cursor_style.trim().to_lowercase();
+        if !matches!(
+            style.as_str(),
+            "block" | "bar" | "beam" | "line" | "underline" | "underscore"
+        ) {
+            w.push(format!(
+                "cursor_style \"{}\": use block, bar or underline",
+                self.cursor_style
+            ));
+        }
+        w
     }
 }
 
@@ -98,27 +195,39 @@ pub fn config_path() -> PathBuf {
     PathBuf::from(appdata).join("tacoterm").join("config.toml")
 }
 
-pub const STARTER_TOML: &str = r##"# tacoterm config — edit and it applies on next launch.
-# Every key is optional: delete a line to get the default back.
+pub const STARTER_TOML: &str = r##"# tacoterm settings. Save this file and most changes apply right away;
+# shell and prompt apply to the next window. Every key is optional: delete
+# a line to get its default back. Ctrl+, opens this file.
+
+# Built-in schemes: tokyo-night, catppuccin-mocha, dracula, one-half-dark,
+# gruvbox-dark, nord, solarized-dark, one-half-light, campbell.
+# Ctrl+Shift+T cycles through them to preview.
+color_scheme = "tokyo-night"
 
 font_family = "Cascadia Mono"
 font_size = 14.0
-line_height = 1.2          # multiple of font_size
-padding = 4                # pixels around the grid
+line_height = 1.25          # multiple of font_size
+padding = 10                # pixels around the text
+cursor_style = "block"      # block, bar or underline
 scrollback_lines = 10000
-shell = "C:\\Windows\\System32\\cmd.exe"  # or "pwsh.exe -NoLogo", "wsl.exe ~"
 
+shell = "C:\\Windows\\System32\\cmd.exe"   # or "pwsh.exe -NoLogo", "wsl.exe ~"
+
+# cmd.exe's prompt. $P path, $G >, $_ new line, $E escape (for colors:
+# $E[32m green … $E[0m reset). "" keeps cmd's own C:\> prompt.
+# PowerShell and WSL set their prompt in their own profile.
+prompt = "$E[1;34m$P$E[0m $E[32m❯$E[0m "
+
+# Override single colors of the scheme (all optional):
 [theme]
-background = "#0c0c0c"
-foreground = "#cccccc"
-cursor = "#cccccc"
-selection = "#264f78"
-palette = [
-  "#0c0c0c", "#c50f1f", "#13a10e", "#c19c00",
-  "#0037da", "#881798", "#3a96dd", "#cccccc",
-  "#767676", "#e74856", "#16c60c", "#f9f1a5",
-  "#3b78ff", "#b4009e", "#61d6d6", "#f2f2f2",
-]
+# background = "#1a1b26"
+# foreground = "#c0caf5"
+# cursor = "#c0caf5"
+# selection = "#33467c"
+# palette = ["#15161e", "#f7768e", "#9ece6a", "#e0af68",
+#            "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
+#            "#414868", "#f7768e", "#9ece6a", "#e0af68",
+#            "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"]
 
 # Mouse: drag to select, right-click copies a selection or pastes.
 [keybindings]
@@ -128,6 +237,8 @@ scroll_page_up = "shift+pageup"
 scroll_page_down = "shift+pagedown"
 scroll_to_top = "ctrl+shift+home"
 scroll_to_bottom = "ctrl+shift+end"
+next_color_scheme = "ctrl+shift+t"
+open_settings = "ctrl+,"
 "##;
 
 /// Parse config text. Errors carry a human-readable message.
@@ -136,20 +247,23 @@ pub fn parse(text: &str) -> Result<Config, String> {
 }
 
 /// Load the config, writing the starter file on first run.
-/// A broken config falls back to defaults and returns a warning for the
+/// A broken config falls back to defaults and returns warnings for the
 /// app to show — a bad config never blanks the terminal.
-pub fn load() -> (Config, Option<String>) {
+pub fn load() -> (Config, Vec<String>) {
     let path = config_path();
     match std::fs::read_to_string(&path) {
         Ok(text) => match parse(&text) {
-            Ok(cfg) => (cfg, None),
+            Ok(cfg) => {
+                let w = cfg.warnings();
+                (cfg, w)
+            }
             Err(e) => (
                 Config::default(),
-                Some(format!(
+                vec![format!(
                     "bad config {}: {}; using defaults",
                     path.display(),
                     e.trim_end()
-                )),
+                )],
             ),
         },
         Err(_) => {
@@ -157,14 +271,14 @@ pub fn load() -> (Config, Option<String>) {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(&path, STARTER_TOML);
-            (Config::default(), None)
+            (Config::default(), Vec::new())
         }
     }
 }
 
 /// Parse #rrggbb into (r, g, b).
-pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
-    let s = s.strip_prefix('#')?;
+pub fn parse_hex(s: &str) -> Option<Rgb> {
+    let s = s.trim().strip_prefix('#')?;
     if s.len() != 6 || !s.is_ascii() {
         return None;
     }
@@ -184,17 +298,39 @@ mod tests {
         let def = Config::default();
         assert_eq!(cfg.font_family, def.font_family);
         assert_eq!(cfg.shell, def.shell);
-        assert_eq!(cfg.theme.palette, def.theme.palette);
-        assert_eq!(cfg.keybindings.copy, def.keybindings.copy);
+        assert_eq!(cfg.prompt, def.prompt);
+        assert_eq!(cfg.color_scheme, def.color_scheme);
+        assert_eq!(cfg.padding, def.padding);
+        assert_eq!(cfg.keybindings.open_settings, def.keybindings.open_settings);
+        assert!(cfg.warnings().is_empty());
     }
 
     #[test]
-    fn partial_config_fills_defaults() {
-        let cfg = parse("font_size = 18.0\n[theme]\nbackground = \"#101010\"\n").unwrap();
-        assert_eq!(cfg.font_size, 18.0);
-        assert_eq!(cfg.theme.background, "#101010");
-        assert_eq!(cfg.theme.foreground, "#cccccc");
-        assert_eq!(cfg.keybindings.paste, "ctrl+shift+v");
+    fn scheme_with_overrides() {
+        let cfg = parse(
+            "color_scheme = \"Dracula\"\n[theme]\nbackground = \"#101010\"\npalette = [\"#010203\"]\n",
+        )
+        .unwrap();
+        let (theme, warnings) = cfg.theme();
+        assert!(warnings.is_empty());
+        assert_eq!(theme.background, (0x10, 0x10, 0x10));
+        assert_eq!(theme.foreground, (0xf8, 0xf8, 0xf2));
+        assert_eq!(theme.palette[0], (1, 2, 3));
+        assert_eq!(theme.palette[1], (0xff, 0x55, 0x55));
+    }
+
+    #[test]
+    fn bad_values_warn_and_fall_back() {
+        let cfg =
+            parse("color_scheme = \"neon\"\ncursor_style = \"blob\"\n[theme]\ncursor = \"red\"\n")
+                .unwrap();
+        let w = cfg.warnings();
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert_eq!(
+            cfg.theme().0.background,
+            parse_hex(schemes::SCHEMES[0].background).unwrap()
+        );
+        assert_eq!(cfg.cursor_style(), CursorStyle::Block);
     }
 
     #[test]

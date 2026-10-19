@@ -18,7 +18,7 @@ use cosmic_text::{
 };
 use winit::window::Window;
 
-use crate::config::{parse_hex, Config};
+use crate::config::{Config, CursorStyle, Rgb, Theme};
 use crate::grid::{Attr, Color, Grid};
 
 const ATLAS_SIZE: u32 = 1024;
@@ -290,8 +290,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 // ---- colors ------------------------------------------------------------
 
-type Rgb = (u8, u8, u8);
-
 struct Colors {
     background: Rgb,
     foreground: Rgb,
@@ -301,15 +299,9 @@ struct Colors {
 }
 
 impl Colors {
-    fn from_config(config: &Config) -> Colors {
-        let defaults = crate::config::Theme::default();
-        let theme = &config.theme;
-        let pick = |s: &str, d: &str| parse_hex(s).or_else(|| parse_hex(d)).unwrap_or((0, 0, 0));
+    fn from_theme(theme: &Theme) -> Colors {
         let mut palette = [(0, 0, 0); 256];
-        for (i, slot) in palette.iter_mut().enumerate().take(16) {
-            let s = theme.palette.get(i).map(String::as_str).unwrap_or("");
-            *slot = pick(s, &defaults.palette[i]);
-        }
+        palette[..16].copy_from_slice(&theme.palette);
         // xterm 6×6×6 color cube, then the 24-step grayscale ramp.
         const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
         for i in 0..216 {
@@ -320,10 +312,10 @@ impl Colors {
             palette[232 + i] = (v, v, v);
         }
         Colors {
-            background: pick(&theme.background, &defaults.background),
-            foreground: pick(&theme.foreground, &defaults.foreground),
-            cursor: pick(&theme.cursor, &defaults.cursor),
-            selection: pick(&theme.selection, &defaults.selection),
+            background: theme.background,
+            foreground: theme.foreground,
+            cursor: theme.cursor,
+            selection: theme.selection,
             palette,
         }
     }
@@ -382,7 +374,10 @@ pub struct Renderer {
     glyphs: HashMap<GlyphKey, Option<CachedGlyph>>,
     colors: Colors,
     padding: u32,
-    /// Hollow cursor when unfocused, block when focused.
+    cursor_style: CursorStyle,
+    /// DPI scale the fonts were built for.
+    scale: f64,
+    /// Solid cursor when focused, outlined when not.
     pub focused: bool,
 }
 
@@ -434,7 +429,7 @@ impl Renderer {
             (size.width.max(1), size.height.max(1)),
             fonts,
             config,
-            (config.padding as f64 * scale).round() as u32,
+            scale,
         ))
     }
 
@@ -478,7 +473,7 @@ impl Renderer {
             (width, height),
             fonts,
             config,
-            config.padding,
+            1.0,
         ))
     }
 
@@ -491,7 +486,7 @@ impl Renderer {
         (width, height): (u32, u32),
         fonts: Fonts,
         config: &Config,
-        padding: u32,
+        scale: f64,
     ) -> Renderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tacoterm"),
@@ -638,8 +633,10 @@ impl Renderer {
             font_config: config.clone(),
             atlas: Atlas::new(),
             glyphs: HashMap::new(),
-            colors: Colors::from_config(config),
-            padding,
+            colors: Colors::from_theme(&config.theme().0),
+            cursor_style: config.cursor_style(),
+            scale,
+            padding: (config.padding as f64 * scale).round() as u32,
             focused: true,
         }
     }
@@ -674,10 +671,41 @@ impl Renderer {
     /// The DPI scale changed (window moved to another monitor): re-measure
     /// fonts and drop cached glyphs.
     pub fn set_scale(&mut self, scale: f64) {
-        self.fonts = Fonts::new(&self.font_config, scale);
-        self.padding = (self.font_config.padding as f64 * scale).round() as u32;
+        self.scale = scale;
+        self.reload_fonts();
+    }
+
+    fn reload_fonts(&mut self) {
+        self.fonts = Fonts::new(&self.font_config, self.scale);
+        self.padding = (self.font_config.padding as f64 * self.scale).round() as u32;
         self.glyphs.clear();
         self.atlas = Atlas::new();
+    }
+
+    /// Apply a changed config: colors and cursor right away, and fonts when
+    /// a font setting changed. Returns true when the cell size or padding
+    /// may have changed, so the grid needs refitting.
+    pub fn set_config(&mut self, config: &Config) -> bool {
+        self.set_theme(&config.theme().0);
+        self.cursor_style = config.cursor_style();
+        let old = &self.font_config;
+        let fonts_changed = old.font_family != config.font_family
+            || old.font_size != config.font_size
+            || old.line_height != config.line_height
+            || old.padding != config.padding;
+        self.font_config = config.clone();
+        if fonts_changed {
+            self.reload_fonts();
+        }
+        fonts_changed
+    }
+
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.colors = Colors::from_theme(theme);
+    }
+
+    pub fn background(&self) -> Rgb {
+        self.colors.background
     }
 
     /// (cols, rows) that fit the surface at the current cell metrics.
@@ -808,20 +836,31 @@ impl Renderer {
                     bg = self.colors.selection;
                 }
                 let cursor_here = show_cursor && x == grid.cursor_x && y == grid.cursor_y;
-                if cursor_here && self.focused {
+                let solid_block =
+                    cursor_here && self.focused && self.cursor_style == CursorStyle::Block;
+                if solid_block {
                     bg = self.colors.cursor;
                     fg = self.colors.background;
                 }
                 if bg != self.colors.background {
                     backgrounds.push(rect(px, py, cw * span, ch, self.color(bg, 1.0)));
                 }
-                if cursor_here && !self.focused {
+                if cursor_here && !solid_block {
                     let c = self.color(self.colors.cursor, 1.0);
                     let (w, h) = (cw * span, ch);
-                    decorations.push(rect(px, py, w, line_px, c));
-                    decorations.push(rect(px, py + h - line_px, w, line_px, c));
-                    decorations.push(rect(px, py, line_px, h, c));
-                    decorations.push(rect(px + w - line_px, py, line_px, h, c));
+                    let thick = (line_px * 2.0).max(2.0);
+                    match self.cursor_style {
+                        CursorStyle::Bar => decorations.push(rect(px, py, thick, h, c)),
+                        CursorStyle::Underline => {
+                            decorations.push(rect(px, py + h - thick, w, thick, c))
+                        }
+                        CursorStyle::Block => {
+                            decorations.push(rect(px, py, w, line_px, c));
+                            decorations.push(rect(px, py + h - line_px, w, line_px, c));
+                            decorations.push(rect(px, py, line_px, h, c));
+                            decorations.push(rect(px + w - line_px, py, line_px, h, c));
+                        }
+                    }
                 }
                 let alpha = if cell.attr.has(Attr::DIM) { 0.6 } else { 1.0 };
                 let fg_color = self.color(fg, alpha);

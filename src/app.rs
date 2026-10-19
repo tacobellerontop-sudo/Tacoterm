@@ -8,6 +8,7 @@ use std::io::Read;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -15,12 +16,13 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Window, WindowId};
+use winit::window::{Theme as WindowTheme, Window, WindowId};
 
 use tacoterm::config::{self, Config};
 use tacoterm::grid::{Grid, Point};
 use tacoterm::input::{encode_key, key_to_bytes, Action, Bindings};
 use tacoterm::renderer::{Fonts, Renderer};
+use tacoterm::schemes;
 use tacoterm::vt::Vt;
 
 use crate::pty::Pty;
@@ -33,17 +35,20 @@ const WHEEL_LINES: f64 = 3.0;
 enum Wake {
     PtyOutput,
     ChildExited,
+    /// config.toml was saved.
+    ConfigChanged,
 }
 
 pub fn run() -> Result<(), String> {
-    let (config, warning) = config::load();
+    let (config, warnings) = config::load();
     let event_loop = EventLoop::<Wake>::with_user_event()
         .build()
         .map_err(|e| e.to_string())?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
     let mut app = App::new(config, proxy);
-    app.warnings.extend(warning);
+    app.warnings.extend(warnings);
+    watch_config(app.proxy.clone());
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     match app.error {
         Some(e) => Err(e),
@@ -83,11 +88,48 @@ fn show_warning(msg: String) {
     });
 }
 
+/// Poll config.toml's modification time and wake the loop when it changes.
+/// Polling (twice a second) is simpler than a directory watcher and catches
+/// editors that save by replacing the file.
+fn watch_config(proxy: EventLoopProxy<Wake>) {
+    let path = config::config_path();
+    let stamp = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    thread::spawn(move || {
+        let mut last = stamp(&path);
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            let now = stamp(&path);
+            if now != last {
+                last = now;
+                if proxy.send_event(Wake::ConfigChanged).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Dark title bar for dark backgrounds, light for light ones.
+fn title_bar_theme(bg: config::Rgb) -> WindowTheme {
+    let luma = 0.299 * bg.0 as f32 + 0.587 * bg.1 as f32 + 0.114 * bg.2 as f32;
+    if luma < 128.0 {
+        WindowTheme::Dark
+    } else {
+        WindowTheme::Light
+    }
+}
+
 struct App {
     config: Config,
     proxy: EventLoopProxy<Wake>,
     bindings: Bindings,
     warnings: Vec<String>,
+    /// Warnings already shown for the current config file, so a save that
+    /// doesn't fix them doesn't pop them up again.
+    shown_warnings: Vec<String>,
+    /// The scheme on screen; Ctrl+Shift+T moves it without touching the
+    /// file.
+    scheme: String,
     /// A fatal error to report once the event loop exits.
     error: Option<String>,
     window: Option<Arc<Window>>,
@@ -108,12 +150,15 @@ struct App {
 impl App {
     fn new(config: Config, proxy: EventLoopProxy<Wake>) -> Self {
         let (bindings, warnings) = Bindings::from_config(&config.keybindings);
+        let scheme = config.color_scheme.clone();
         let grid = Grid::new(80, 24, config.scrollback_lines);
         App {
             config,
             proxy,
             bindings,
             warnings,
+            shown_warnings: Vec::new(),
+            scheme,
             error: None,
             window: None,
             renderer: None,
@@ -145,6 +190,10 @@ impl App {
     /// writes and resizes.
     fn spawn_pty(&mut self) -> Result<(), String> {
         let shell = self.config.shell.clone();
+        if is_cmd(&shell) && !self.config.prompt.is_empty() {
+            // cmd.exe reads its prompt from the environment it inherits.
+            std::env::set_var("PROMPT", &self.config.prompt);
+        }
         let (cols, rows) = (self.grid.cols as u16, self.grid.rows as u16);
         let pty =
             Pty::spawn(&shell, cols, rows).map_err(|e| format!("cannot start {shell}: {e}"))?;
@@ -269,8 +318,85 @@ impl App {
             Action::ScrollPageDown => self.grid.scroll_view(-page),
             Action::ScrollToTop => self.grid.scroll_view(isize::MAX / 2),
             Action::ScrollToBottom => self.grid.scroll_view_to_bottom(),
+            Action::NextColorScheme => self.next_scheme(),
+            Action::OpenSettings => {
+                let path = config::config_path();
+                if let Err(e) = std::process::Command::new("notepad.exe").arg(&path).spawn() {
+                    show_warning(format!("cannot open {}: {e}", path.display()));
+                }
+            }
         }
         self.redraw();
+    }
+
+    /// Show the next built-in scheme (a preview: the file is unchanged).
+    fn next_scheme(&mut self) {
+        let next = schemes::next(&self.scheme);
+        self.scheme = next.name.to_string();
+        let preview = Config {
+            color_scheme: next.name.to_string(),
+            theme: Default::default(),
+            ..self.config.clone()
+        };
+        self.apply_theme(&preview.theme().0);
+        if let Some(w) = &self.window {
+            w.set_title(&format!(
+                "tacoterm — {} (set color_scheme = \"{}\" to keep it)",
+                next.name, next.name
+            ));
+        }
+    }
+
+    fn apply_theme(&mut self, theme: &config::Theme) {
+        if let Some(r) = &mut self.renderer {
+            r.set_theme(theme);
+        }
+        if let Some(w) = &self.window {
+            w.set_theme(Some(title_bar_theme(theme.background)));
+        }
+        self.redraw();
+    }
+
+    /// config.toml changed on disk: apply what can change live.
+    fn reload_config(&mut self) {
+        let path = config::config_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let config = match config::parse(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                self.report(vec![format!(
+                    "bad config {}: {}",
+                    path.display(),
+                    e.trim_end()
+                )]);
+                return;
+            }
+        };
+        let (bindings, mut warnings) = Bindings::from_config(&config.keybindings);
+        warnings.extend(config.warnings());
+        self.report(warnings);
+        self.bindings = bindings;
+        self.grid.scrollback_limit = config.scrollback_lines;
+        self.scheme = config.color_scheme.clone();
+        let refit = match &mut self.renderer {
+            Some(r) => r.set_config(&config),
+            None => false,
+        };
+        self.apply_theme(&config.theme().0);
+        self.config = config;
+        if refit {
+            self.fit_grid();
+        }
+    }
+
+    /// Show warnings that weren't already shown for this config.
+    fn report(&mut self, warnings: Vec<String>) {
+        if warnings != self.shown_warnings && !warnings.is_empty() {
+            show_warning(warnings.join("\n\n"));
+        }
+        self.shown_warnings = warnings;
     }
 
     fn point_under_mouse(&self) -> Option<Point> {
@@ -329,6 +455,7 @@ impl ApplicationHandler<Wake> for App {
         );
         let attrs = Window::default_attributes()
             .with_title("tacoterm")
+            .with_theme(Some(title_bar_theme(self.config.theme().0.background)))
             .with_inner_size(size);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -350,9 +477,8 @@ impl ApplicationHandler<Wake> for App {
         if let Err(e) = self.spawn_pty() {
             return self.fail(event_loop, e);
         }
-        for w in self.warnings.drain(..) {
-            show_warning(w);
-        }
+        let warnings = std::mem::take(&mut self.warnings);
+        self.report(warnings);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -454,9 +580,23 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
+        if let Wake::ConfigChanged = event {
+            return self.reload_config();
+        }
         self.drain_pty();
         if let Wake::ChildExited = event {
             event_loop.exit();
         }
     }
+}
+
+/// Whether a shell command line runs cmd.exe.
+fn is_cmd(shell: &str) -> bool {
+    let shell = shell.trim();
+    let program = match shell.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => shell.split(' ').next().unwrap_or(""),
+    };
+    let name = program.rsplit(['\\', '/']).next().unwrap_or("");
+    name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
 }

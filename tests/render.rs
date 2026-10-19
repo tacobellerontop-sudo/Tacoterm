@@ -9,7 +9,11 @@ use tacoterm::vt::Vt;
 
 #[test]
 fn renders_text_colors_cursor_and_selection() {
-    let config = Config::default();
+    let config = Config {
+        color_scheme: "campbell".into(),
+        padding: 4,
+        ..Config::default()
+    };
     let fonts = Fonts::new(&config, 1.0);
     let (cw, ch) = (fonts.cell_width, fonts.cell_height);
     let (cols, rows) = (40u32, 8u32);

@@ -151,6 +151,8 @@ pub enum Action {
     ScrollPageDown,
     ScrollToTop,
     ScrollToBottom,
+    NextColorScheme,
+    OpenSettings,
 }
 
 /// A parsed key combo such as `ctrl+shift+c`.
@@ -232,6 +234,8 @@ impl Bindings {
             (&kb.scroll_page_down, Action::ScrollPageDown),
             (&kb.scroll_to_top, Action::ScrollToTop),
             (&kb.scroll_to_bottom, Action::ScrollToBottom),
+            (&kb.next_color_scheme, Action::NextColorScheme),
+            (&kb.open_settings, Action::OpenSettings),
         ] {
             if combo.trim().is_empty() {
                 continue;
@@ -335,6 +339,10 @@ mod tests {
         assert_eq!(
             b.lookup(&Key::Named(NamedKey::PageUp), ModifiersState::SHIFT),
             Some(Action::ScrollPageUp)
+        );
+        assert_eq!(
+            b.lookup(&ch(","), ModifiersState::CONTROL),
+            Some(Action::OpenSettings)
         );
         assert!(KeyCombo::parse("hyper+x").is_err());
     }

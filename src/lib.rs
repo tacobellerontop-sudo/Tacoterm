@@ -9,4 +9,5 @@ pub mod config;
 pub mod grid;
 pub mod input;
 pub mod renderer;
+pub mod schemes;
 pub mod vt;
