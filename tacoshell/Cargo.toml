@@ -1,0 +1,21 @@
+[package]
+name = "tacoshell"
+version = "0.1.0"
+edition = "2021"
+description = "A native command shell for Windows, the companion to tacoterm"
+license = "MIT"
+
+[dependencies]
+# Column width of wide (CJK, emoji) characters in the line editor
+unicode-width = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Console modes (raw input, VT), window size, Ctrl+C
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# termios and window size, so the shell can be tried out on Linux / macOS too
+libc = "0.2"

@@ -8,6 +8,10 @@ license = "MIT"
 # The terminal core (grid, VT parser, renderer, config, key mapping) is a
 # portable library so it can be unit-tested anywhere; the binary that wires it
 # to ConPTY is Windows-only.
+[workspace]
+# tacoshell, the companion shell, lives in its own crate.
+members = ["tacoshell"]
+
 [lib]
 name = "tacoterm"
 path = "src/lib.rs"

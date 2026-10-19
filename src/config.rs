@@ -271,6 +271,17 @@ pub fn available_shells() -> Vec<ShellChoice> {
             setting: "wsl.exe ~",
         });
     }
+    // tacoshell, the companion shell, when it's beside tacoterm.exe (where
+    // the build puts it, and where Windows looks first) or on PATH.
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("tacoshell.exe")));
+    if find_program("tacoshell.exe", beside).is_some() {
+        out.push(ShellChoice {
+            label: "tacoshell",
+            setting: "tacoshell.exe",
+        });
+    }
     out
 }
 

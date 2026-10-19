@@ -1932,6 +1932,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tacoshell"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "unicode-width",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "tacoterm"
 version = "0.1.0"
 dependencies = [
