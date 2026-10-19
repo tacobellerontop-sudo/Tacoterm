@@ -18,13 +18,14 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Theme as WindowTheme, Window, WindowId};
 
-use tacoterm::config::{self, Config};
+use tacoterm::config::{self, Config, ShellKind};
 use tacoterm::grid::{Grid, Point};
 use tacoterm::input::{encode_key, key_to_bytes, Action, Bindings};
 use tacoterm::renderer::{Fonts, Renderer};
 use tacoterm::schemes;
 use tacoterm::vt::Vt;
 
+use crate::menu;
 use crate::pty::Pty;
 
 /// Lines scrolled per mouse-wheel notch.
@@ -34,7 +35,8 @@ const WHEEL_LINES: f64 = 3.0;
 #[derive(Debug, Clone, Copy)]
 enum Wake {
     PtyOutput,
-    ChildExited,
+    /// The shell of this generation exited (see `App::pty_gen`).
+    ChildExited(u64),
     /// config.toml was saved.
     ConfigChanged,
 }
@@ -138,6 +140,9 @@ struct App {
     vt: Vt,
     pty: Option<Pty>,
     pty_rx: Option<Receiver<Vec<u8>>>,
+    /// Bumped on every shell (re)start, so an old shell's exit doesn't
+    /// close the window.
+    pty_gen: u64,
     mods: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     mouse_pos: (f64, f64),
@@ -166,6 +171,7 @@ impl App {
             vt: Vt::new(),
             pty: None,
             pty_rx: None,
+            pty_gen: 0,
             mods: ModifiersState::empty(),
             clipboard: None,
             mouse_pos: (0.0, 0.0),
@@ -189,11 +195,14 @@ impl App {
     /// process handle to an exit watcher. The UI thread keeps the Pty for
     /// writes and resizes.
     fn spawn_pty(&mut self) -> Result<(), String> {
-        let shell = self.config.shell.clone();
-        if is_cmd(&shell) && !self.config.prompt.is_empty() {
-            // cmd.exe reads its prompt from the environment it inherits.
-            std::env::set_var("PROMPT", &self.config.prompt);
+        let (shell, env) = self.config.shell_command();
+        // The shell inherits our environment (cmd.exe reads PROMPT there).
+        std::env::remove_var("PROMPT");
+        for (k, v) in env {
+            std::env::set_var(k, v);
         }
+        self.pty_gen += 1;
+        let gen = self.pty_gen;
         let (cols, rows) = (self.grid.cols as u16, self.grid.rows as u16);
         let pty =
             Pty::spawn(&shell, cols, rows).map_err(|e| format!("cannot start {shell}: {e}"))?;
@@ -224,10 +233,74 @@ impl App {
         let proxy = self.proxy.clone();
         thread::spawn(move || {
             waiter.wait();
-            let _ = proxy.send_event(Wake::ChildExited);
+            let _ = proxy.send_event(Wake::ChildExited(gen));
         });
         self.pty = Some(pty);
         Ok(())
+    }
+
+    /// Replace the running shell with a fresh one (after a shell change).
+    fn restart_shell(&mut self) {
+        if let Some(mut p) = self.pty.take() {
+            let _ = p.terminate();
+            // Dropping closes the pseudo-console; the old reader keeps
+            // draining it meanwhile, into the channel replaced below.
+        }
+        self.grid = Grid::new(self.grid.cols, self.grid.rows, self.config.scrollback_lines);
+        self.vt = Vt::new();
+        if let Err(e) = self.spawn_pty() {
+            show_warning(e);
+        }
+        self.redraw();
+    }
+
+    /// The right-click menu.
+    fn context_menu(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let shells = config::available_shells();
+        let current_shell = match ShellKind::of(&self.config.shell) {
+            _ if self.config.shell.trim().is_empty()
+                || self.config.shell.trim().eq_ignore_ascii_case("auto") =>
+            {
+                "auto"
+            }
+            ShellKind::Cmd => "cmd.exe",
+            _ if self.config.shell.to_lowercase().contains("wsl") => "wsl.exe ~",
+            _ => "",
+        };
+        let has_selection = self.grid.selection.is_some();
+        let picked = menu::show(&window, has_selection, &self.scheme, &shells, current_shell);
+        match picked {
+            Some(menu::Choice::Copy) => {
+                self.copy_selection();
+                self.grid.selection = None;
+            }
+            Some(menu::Choice::Paste) => self.paste(),
+            Some(menu::Choice::Settings) => self.run_action(Action::OpenSettings),
+            Some(menu::Choice::Scheme(name)) => {
+                // Show it now; saving makes the file watcher agree.
+                self.scheme = name.to_string();
+                self.config.color_scheme = name.to_string();
+                self.apply_theme(&self.config.theme().0);
+                self.save_setting("color_scheme", name);
+            }
+            Some(menu::Choice::Shell(setting)) => {
+                self.config.shell = setting.to_string();
+                self.save_setting("shell", setting);
+                self.restart_shell();
+            }
+            None => {}
+        }
+        self.redraw();
+    }
+
+    fn save_setting(&self, key: &str, value: &str) {
+        let toml_value = toml::Value::String(value.to_string()).to_string();
+        if let Err(e) = config::set_top_level(key, &toml_value) {
+            show_warning(format!("cannot save {key}: {e}"));
+        }
     }
 
     /// Parse everything the drain thread delivered, answer any queries, then
@@ -547,6 +620,12 @@ impl ApplicationHandler<Wake> for App {
                 (MouseButton::Left, ElementState::Released) => {
                     self.press_point = None;
                 }
+                // Menus open on release, like the rest of Windows: opening
+                // on press lets the release pick whatever lands under it.
+                (MouseButton::Right, ElementState::Released) if self.config.right_click_menu() => {
+                    self.context_menu();
+                }
+                (MouseButton::Right, ElementState::Pressed) if self.config.right_click_menu() => {}
                 // Right-click copies a selection, or pastes — like conhost.
                 (MouseButton::Right, ElementState::Pressed) => {
                     if self.copy_selection() {
@@ -584,19 +663,10 @@ impl ApplicationHandler<Wake> for App {
             return self.reload_config();
         }
         self.drain_pty();
-        if let Wake::ChildExited = event {
-            event_loop.exit();
+        if let Wake::ChildExited(gen) = event {
+            if gen == self.pty_gen {
+                event_loop.exit();
+            }
         }
     }
-}
-
-/// Whether a shell command line runs cmd.exe.
-fn is_cmd(shell: &str) -> bool {
-    let shell = shell.trim();
-    let program = match shell.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or(""),
-        None => shell.split(' ').next().unwrap_or(""),
-    };
-    let name = program.rsplit(['\\', '/']).next().unwrap_or("");
-    name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
 }

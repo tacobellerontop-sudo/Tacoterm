@@ -8,7 +8,7 @@ side nothing is unusual — they talk to a console, as always.
 
 ## Status: MVP
 
-One resizable window onto `cmd.exe`, PowerShell or WSL, drawn on the GPU:
+One resizable window onto PowerShell (the default), `cmd.exe` or WSL, drawn on the GPU:
 
 - ConPTY spawn / resize / teardown; the window closes when the shell exits
 - VT parsing for what ConPTY and full-screen apps emit: cursor movement,
@@ -17,8 +17,7 @@ One resizable window onto `cmd.exe`, PowerShell or WSL, drawn on the GPU:
   reports, bracketed paste, application cursor keys
 - Wide characters (CJK, emoji) and font fallback via cosmic-text
 - Scrollback (mouse wheel, Shift+PgUp/PgDn, Ctrl+Shift+Home/End)
-- Copy / paste: drag to select; Ctrl+Shift+C / Ctrl+Shift+V; right-click
-  copies a selection or pastes, like conhost
+- Copy / paste: drag to select; Ctrl+Shift+C / Ctrl+Shift+V, or the right-click menu
 - Built-in color schemes, cursor styles and a colored cmd prompt
 - `config.toml` settings that apply live when saved
 - Per-monitor DPI scaling
@@ -38,10 +37,12 @@ that frame.
 
 ## Settings
 
-First run writes `%APPDATA%\tacoterm\config.toml` (Ctrl+, opens it in
-Notepad). Save it and colors, fonts, cursor and keybindings apply right
-away; shell and prompt apply to the next window. Every key is optional, and
-a mistake shows a warning and falls back to the default.
+**Right-click** anywhere in tacoterm for Copy, Paste, the color scheme, the
+shell (PowerShell, Command Prompt, WSL) and **All settings…**, which opens
+`%APPDATA%\tacoterm\config.toml` in Notepad (so does Ctrl+,). Save that
+file and colors, fonts, cursor and keybindings apply right away; shell and
+prompt apply to the next shell. Every key is optional, and a mistake shows
+a warning and falls back to the default.
 
 ```toml
 # tokyo-night, catppuccin-mocha, dracula, one-half-dark, gruvbox-dark,
@@ -52,9 +53,9 @@ font_family = "Cascadia Mono"    # falls back to Consolas, then others
 font_size = 14.0
 padding = 10
 
-shell = "pwsh.exe -NoLogo"       # any command line: "wsl.exe ~", …
-# cmd.exe's prompt: $P path, $G >, $_ newline, $E[…m colors; "" = C:\>
-prompt = "$E[1;34m$P$E[0m $E[32m❯$E[0m "
+shell = "auto"                   # PowerShell; or "cmd.exe", "wsl.exe ~", …
+prompt = "arrow"                 # path + ❯; "classic" = the shell's own
+right_click = "menu"             # or "paste", like the old console
 
 [theme]                          # override single colors of the scheme
 background = "#101010"

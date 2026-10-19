@@ -10,6 +10,8 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod menu;
+#[cfg(windows)]
 mod pty;
 
 #[cfg(windows)]
