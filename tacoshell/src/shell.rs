@@ -5,7 +5,7 @@ use crate::parse::{self, Connector, Part, Pipeline, Redirect, Script, Word};
 use crate::resolve;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{IsTerminal, PipeReader, PipeWriter, Write};
+use std::io::{PipeReader, PipeWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 
@@ -455,7 +455,6 @@ impl Shell {
         if !(BUILTINS.contains(&builtin) || builtin == "cd.." || is_drive || assignment) {
             return None;
         }
-        let tty = matches!(stdout, Sink::Inherit) && std::io::stdout().is_terminal();
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
         let status = if assignment {
@@ -467,7 +466,7 @@ impl Shell {
         } else if builtin == "cd.." {
             self.cd(&["..".to_string()], &mut out, &mut err)
         } else {
-            self.builtin(builtin, &args[1..], tty, &mut out, &mut err)
+            self.builtin(builtin, &args[1..], &mut out, &mut err)
         };
         // Output is gathered first and then handed over, so a builtin
         // feeding a pipe can't block on a reader that hasn't started yet.
@@ -498,7 +497,6 @@ impl Shell {
         &mut self,
         name: &str,
         args: &[String],
-        tty: bool,
         out: &mut Vec<u8>,
         err: &mut Vec<u8>,
     ) -> i32 {
@@ -539,7 +537,7 @@ impl Shell {
                     2
                 }
             },
-            "set" | "export" if args.is_empty() => self.builtin("env", args, tty, out, err),
+            "set" | "export" if args.is_empty() => self.builtin("env", args, out, err),
             "set" | "export" => {
                 let mut status = 0;
                 for arg in args {
@@ -660,7 +658,7 @@ impl Shell {
                     2
                 }
             },
-            "ls" => ls(args, tty, out, err),
+            "ls" => ls(args, out, err),
             _ => unreachable!("{name} is in BUILTINS"),
         }
     }
@@ -738,7 +736,7 @@ fn set_var(name: &str, value: &str) {
     }
 }
 
-fn ls(args: &[String], tty: bool, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
+fn ls(args: &[String], out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
     let all = args.iter().any(|a| a == "-a");
     let mut paths: Vec<&str> = args
         .iter()
@@ -748,7 +746,6 @@ fn ls(args: &[String], tty: bool, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
     if paths.is_empty() {
         paths.push(".");
     }
-    let sep = if cfg!(windows) { '\\' } else { '/' };
     let mut status = 0;
     for (n, path) in paths.iter().enumerate() {
         let entries = match std::fs::read_dir(path) {
@@ -769,49 +766,15 @@ fn ls(args: &[String], tty: bool, out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
         if paths.len() > 1 {
             let _ = writeln!(out, "{}{path}:", if n > 0 { "\n" } else { "" });
         }
-        let mut names: Vec<(String, bool)> = entries
+        let mut names: Vec<String> = entries
             .flatten()
-            .map(|e| {
-                (
-                    e.file_name().to_string_lossy().into_owned(),
-                    e.path().is_dir(),
-                )
-            })
-            .filter(|(name, _)| all || !name.starts_with('.'))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| all || !name.starts_with('.'))
             .collect();
-        names.sort_by_key(|(name, _)| name.to_lowercase());
-        if !tty {
-            for (name, _) in names {
-                let _ = writeln!(out, "{name}");
-            }
-            continue;
+        names.sort_by_key(|name| name.to_lowercase());
+        for name in names {
+            let _ = writeln!(out, "{name}");
         }
-        let shown: Vec<String> = names
-            .iter()
-            .map(|(name, dir)| {
-                if *dir {
-                    format!("{name}{sep}")
-                } else {
-                    name.clone()
-                }
-            })
-            .collect();
-        let grid = crate::editor::columns(&shown, crate::term::columns());
-        // Color the folders: the grid has the same names in the same order.
-        let mut colored = String::new();
-        let mut rest = grid.as_str();
-        for ((_, dir), name) in names.iter().zip(&shown) {
-            let at = rest.find(name.as_str()).unwrap_or(0);
-            colored.push_str(&rest[..at]);
-            if *dir {
-                colored.push_str(&format!("\x1b[1;34m{name}\x1b[0m"));
-            } else {
-                colored.push_str(name);
-            }
-            rest = &rest[at + name.len()..];
-        }
-        colored.push_str(rest);
-        let _ = out.write_all(colored.replace("\r\n", "\n").as_bytes());
     }
     status
 }
