@@ -3,13 +3,16 @@
 //! Implements what ConPTY and the programs behind it actually emit:
 //! printing, C0 controls, cursor movement and save/restore, erasing,
 //! insert/delete, scroll regions, the alternate screen, the common private
-//! modes, device status reports, window titles, and SGR colors (16 ANSI +
-//! 256 + truecolor). Everything else is ignored rather than misrendered —
-//! extend as needed.
+//! modes (including mouse and focus reporting), cursor shape, device status
+//! and attribute reports, window titles, the bell, OSC 52 clipboard writes,
+//! the working directory (OSC 7 / OSC 9;9), and SGR colors (16 ANSI + 256 +
+//! truecolor). Everything else is ignored rather than misrendered — extend
+//! as needed.
 
 use vte::{Params, Perform};
 
-use crate::grid::{Attr, Color, Grid, Pen};
+use crate::config::CursorStyle;
+use crate::grid::{Attr, Color, Grid, MouseMode, Pen};
 
 pub struct Vt {
     parser: vte::Parser,
@@ -18,6 +21,14 @@ pub struct Vt {
     pub responses: Vec<u8>,
     /// Set when the program changed the window title (OSC 0 / 2).
     pub title: Option<String>,
+    /// Set on BEL. The app clears it once it has rung / flashed.
+    pub bell: bool,
+    /// Text the program asked to put on the clipboard (OSC 52). The app
+    /// takes it after each `advance`.
+    pub clipboard: Option<String>,
+    /// The shell's working directory as last reported (OSC 7 / OSC 9;9),
+    /// in Windows form when it names a drive (`C:\Users\me`).
+    pub cwd: Option<String>,
 }
 
 impl Default for Vt {
@@ -32,6 +43,9 @@ impl Vt {
             parser: vte::Parser::new(),
             responses: Vec::new(),
             title: None,
+            bell: false,
+            clipboard: None,
+            cwd: None,
         }
     }
 
@@ -42,6 +56,9 @@ impl Vt {
             grid,
             responses: &mut self.responses,
             title: &mut self.title,
+            bell: &mut self.bell,
+            clipboard: &mut self.clipboard,
+            cwd: &mut self.cwd,
         };
         self.parser.advance(&mut performer, bytes);
     }
@@ -51,6 +68,9 @@ struct Performer<'a> {
     grid: &'a mut Grid,
     responses: &'a mut Vec<u8>,
     title: &'a mut Option<String>,
+    bell: &'a mut bool,
+    clipboard: &'a mut Option<String>,
+    cwd: &'a mut Option<String>,
 }
 
 /// params[i], or `default` when missing or 0 (VT counts treat 0 as 1).
@@ -81,7 +101,7 @@ impl Perform for Performer<'_> {
             0x0d => self.grid.carriage_return(),
             0x08 => self.grid.backspace(),
             0x09 => self.grid.tab(),
-            0x07 => {} // bell: flash the window eventually; ignore for now
+            0x07 => *self.bell = true,
             _ => {}
         }
     }
@@ -91,16 +111,42 @@ impl Perform for Performer<'_> {
     fn unhook(&mut self) {}
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // OSC 0 / 2: window title. TODO: OSC 52 (clipboard), OSC 8 (links).
-        if let [kind, rest @ ..] = params {
-            if (*kind == b"0" || *kind == b"2") && !rest.is_empty() {
-                let title = rest
-                    .iter()
-                    .map(|p| String::from_utf8_lossy(p))
-                    .collect::<Vec<_>>()
-                    .join(";");
-                *self.title = Some(title);
+        // TODO: OSC 8 (links).
+        let Some((&kind, rest)) = params.split_first() else {
+            return;
+        };
+        // The remaining params rejoined: titles and paths may contain `;`.
+        let joined = |ps: &[&[u8]]| {
+            ps.iter()
+                .map(|p| String::from_utf8_lossy(p))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        match kind {
+            // Window title.
+            b"0" | b"2" if !rest.is_empty() => *self.title = Some(joined(rest)),
+            // Working directory as a `file://host/path` URL.
+            b"7" if !rest.is_empty() => {
+                if let Some(dir) = file_url_path(&joined(rest)) {
+                    *self.cwd = Some(dir);
+                }
             }
+            // ConEmu's `9;9;"path"`: working directory, quotes optional.
+            b"9" if rest.len() > 1 && rest[0] == b"9" => {
+                let raw = joined(&rest[1..]);
+                let dir = raw.trim_matches('"');
+                if !dir.is_empty() {
+                    *self.cwd = Some(dir.to_string());
+                }
+            }
+            // Clipboard write: `52;<selection>;<base64>`, any selection. A
+            // `?` asks to read the clipboard, which we never answer.
+            b"52" if rest.len() >= 2 && rest[1] != b"?" => {
+                if let Some(text) = base64_decode(rest[1]).and_then(|b| String::from_utf8(b).ok()) {
+                    *self.clipboard = Some(text);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -110,6 +156,44 @@ impl Perform for Performer<'_> {
         }
         let private = intermediates.first() == Some(&b'?');
         let g = &mut *self.grid;
+        match (action, intermediates) {
+            // DECSCUSR: cursor shape. 0 (or unknown) hands it back to config.
+            ('q', b" ") => {
+                g.modes.cursor_shape = match param(params, 0, 0) {
+                    1 => Some((CursorStyle::Block, true)),
+                    2 => Some((CursorStyle::Block, false)),
+                    3 => Some((CursorStyle::Underline, true)),
+                    4 => Some((CursorStyle::Underline, false)),
+                    5 => Some((CursorStyle::Bar, true)),
+                    6 => Some((CursorStyle::Bar, false)),
+                    _ => None,
+                };
+                return;
+            }
+            // XTVERSION: our name, as a DCS string.
+            ('q', b">") => {
+                self.responses.extend_from_slice(b"\x1bP>|tacoterm\x1b\\");
+                return;
+            }
+            // Secondary device attributes: VT100-class, version 10, no ROM.
+            ('c', b">") => {
+                self.responses.extend_from_slice(b"\x1b[>0;10;1c");
+                return;
+            }
+            // DECRQM for a private mode: 1 set, 2 reset, 0 not recognized.
+            ('p', b"?$") => {
+                let mode = param(params, 0, 0);
+                let state = match private_mode_state(g, mode) {
+                    Some(true) => 1,
+                    Some(false) => 2,
+                    None => 0,
+                };
+                let reply = format!("\x1b[?{mode};{state}$y");
+                self.responses.extend_from_slice(reply.as_bytes());
+                return;
+            }
+            _ => {}
+        }
         match (action, private) {
             ('A', false) => g.move_cursor_by(0, -(count(params, 0, 1) as isize)),
             ('B' | 'e', false) => g.move_cursor_by(0, count(params, 0, 1) as isize),
@@ -198,9 +282,16 @@ impl Perform for Performer<'_> {
 }
 
 fn set_private_mode(g: &mut Grid, mode: u16, on: bool) {
+    let mouse = |level: MouseMode| if on { level } else { MouseMode::Off };
     match mode {
         1 => g.modes.app_cursor = on,
         7 => g.modes.autowrap = on,
+        // Cursor blink: only adjusts a shape the program already chose.
+        12 => {
+            if let Some((_, blink)) = &mut g.modes.cursor_shape {
+                *blink = on;
+            }
+        }
         25 => g.modes.cursor_visible = on,
         47 | 1047 => {
             if on {
@@ -218,9 +309,106 @@ fn set_private_mode(g: &mut Grid, mode: u16, on: bool) {
                 g.restore_cursor();
             }
         }
+        // X10 (?9) is treated as normal tracking.
+        9 | 1000 => g.modes.mouse = mouse(MouseMode::Click),
+        1002 => g.modes.mouse = mouse(MouseMode::Drag),
+        1003 => g.modes.mouse = mouse(MouseMode::Motion),
+        1004 => g.modes.focus_events = on,
+        1006 => g.modes.mouse_sgr = on,
         2004 => g.modes.bracketed_paste = on,
+        2026 => g.modes.sync_output = on,
         _ => {}
     }
+}
+
+/// Whether a private mode is set, for DECRQM. `None` when we don't know it.
+fn private_mode_state(g: &Grid, mode: u16) -> Option<bool> {
+    let m = &g.modes;
+    Some(match mode {
+        1 => m.app_cursor,
+        7 => m.autowrap,
+        25 => m.cursor_visible,
+        1049 => g.is_alt_screen(),
+        9 | 1000 => m.mouse == MouseMode::Click,
+        1002 => m.mouse == MouseMode::Drag,
+        1003 => m.mouse == MouseMode::Motion,
+        1004 => m.focus_events,
+        1006 => m.mouse_sgr,
+        2004 => m.bracketed_paste,
+        2026 => m.sync_output,
+        _ => return None,
+    })
+}
+
+/// The local path out of a `file://host/path` URL, percent-decoded. A drive
+/// path (`/C:/Users`) becomes Windows form (`C:\Users`); anything else (a
+/// plain Unix path) is kept as is.
+fn file_url_path(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    // Skip the host, which is often empty (`file:///C:/...`).
+    let path = percent_decode(&rest[rest.find('/')?..]);
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        let win = path[1..].replace('/', "\\");
+        // A bare drive (`/C:`) means its root.
+        return Some(if win.len() == 2 { win + "\\" } else { win });
+    }
+    Some(path)
+}
+
+/// Decode `%XX` escapes; malformed ones are kept literally.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let hex = |i: usize| b.get(i).and_then(|&c| (c as char).to_digit(16));
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if let (Some(h), Some(l)) = (hex(i + 1), hex(i + 2)) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode standard (RFC 4648) base64, padding optional. `None` on anything
+/// outside the alphabet or a length no encoder produces.
+fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let value = |c: u8| -> Option<u32> {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        Some(v as u32)
+    };
+    let data = data
+        .strip_suffix(b"==")
+        .or_else(|| data.strip_suffix(b"="))
+        .unwrap_or(data);
+    if data.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    for chunk in data.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            acc = acc << 6 | value(c)?;
+        }
+        // Left-align as if the chunk were full, then keep the whole bytes
+        // it carries (n chars -> n - 1 bytes).
+        acc <<= 6 * (4 - chunk.len() as u32);
+        out.extend_from_slice(&acc.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
 }
 
 /// SGR — select graphic rendition.
@@ -374,6 +562,8 @@ mod tests {
         feed(&mut g, &mut vt, "\x1b[3;4H\x1b[6n\x1b]0;my shell\x07");
         assert_eq!(vt.responses, b"\x1b[3;4R");
         assert_eq!(vt.title.as_deref(), Some("my shell"));
+        // The BEL that ended the OSC is a terminator, not a bell.
+        assert!(!vt.bell);
     }
 
     #[test]
@@ -388,5 +578,139 @@ mod tests {
         feed(&mut g, &mut vt, "\x1b[?1049l");
         assert!(!g.is_alt_screen());
         assert_eq!(row_text(&g, 0), "x");
+    }
+
+    #[test]
+    fn mouse_focus_and_sync_modes() {
+        let mut g = Grid::new(10, 2, 0);
+        let mut vt = Vt::new();
+        assert_eq!(g.modes.mouse, MouseMode::Off);
+        feed(&mut g, &mut vt, "\x1b[?1000;1006h\x1b[?1004h\x1b[?2026h");
+        assert_eq!(g.modes.mouse, MouseMode::Click);
+        assert!(g.modes.mouse_sgr && g.modes.focus_events && g.modes.sync_output);
+        feed(&mut g, &mut vt, "\x1b[?1002h");
+        assert_eq!(g.modes.mouse, MouseMode::Drag);
+        feed(&mut g, &mut vt, "\x1b[?1003h");
+        assert_eq!(g.modes.mouse, MouseMode::Motion);
+        feed(&mut g, &mut vt, "\x1b[?1003l\x1b[?9h");
+        assert_eq!(g.modes.mouse, MouseMode::Click);
+        feed(&mut g, &mut vt, "\x1b[?9l\x1b[?1006l\x1b[?1004l\x1b[?2026l");
+        assert_eq!(g.modes.mouse, MouseMode::Off);
+        assert!(!g.modes.mouse_sgr && !g.modes.focus_events && !g.modes.sync_output);
+        // ESC c puts every mode back.
+        feed(&mut g, &mut vt, "\x1b[?1003;1006;1004h\x1b[5 q\x1bc");
+        assert_eq!(g.modes.mouse, MouseMode::Off);
+        assert!(!g.modes.mouse_sgr && !g.modes.focus_events);
+        assert_eq!(g.modes.cursor_shape, None);
+    }
+
+    #[test]
+    fn decscusr_cursor_shape() {
+        let mut g = Grid::new(10, 2, 0);
+        let mut vt = Vt::new();
+        let cases = [
+            (1, Some((CursorStyle::Block, true))),
+            (2, Some((CursorStyle::Block, false))),
+            (3, Some((CursorStyle::Underline, true))),
+            (4, Some((CursorStyle::Underline, false))),
+            (5, Some((CursorStyle::Bar, true))),
+            (6, Some((CursorStyle::Bar, false))),
+            (0, None),
+        ];
+        for (n, want) in cases {
+            feed(&mut g, &mut vt, &format!("\x1b[{n} q"));
+            assert_eq!(g.modes.cursor_shape, want, "DECSCUSR {n}");
+        }
+        feed(&mut g, &mut vt, "\x1b[6 q\x1b[?12h");
+        assert_eq!(g.modes.cursor_shape, Some((CursorStyle::Bar, true)));
+        feed(&mut g, &mut vt, "\x1b[?12l");
+        assert_eq!(g.modes.cursor_shape, Some((CursorStyle::Bar, false)));
+        // No intermediate: not DECSCUSR (it's DECLL), leave the shape alone.
+        feed(&mut g, &mut vt, "\x1b[0q");
+        assert_eq!(g.modes.cursor_shape, Some((CursorStyle::Bar, false)));
+    }
+
+    #[test]
+    fn attribute_and_version_queries() {
+        let mut g = Grid::new(10, 2, 0);
+        let mut vt = Vt::new();
+        feed(&mut g, &mut vt, "\x1b[>c");
+        assert_eq!(vt.responses, b"\x1b[>0;10;1c");
+        vt.responses.clear();
+        feed(&mut g, &mut vt, "\x1b[>q");
+        assert_eq!(vt.responses, b"\x1bP>|tacoterm\x1b\\");
+        vt.responses.clear();
+        feed(&mut g, &mut vt, "\x1b[c");
+        assert_eq!(vt.responses, b"\x1b[?1;2c");
+        vt.responses.clear();
+        feed(
+            &mut g,
+            &mut vt,
+            "\x1b[?2026$p\x1b[?2026h\x1b[?2026$p\x1b[?4242$p",
+        );
+        assert_eq!(vt.responses, b"\x1b[?2026;2$y\x1b[?2026;1$y\x1b[?4242;0$y");
+    }
+
+    #[test]
+    fn bell() {
+        let mut g = Grid::new(10, 2, 0);
+        let mut vt = Vt::new();
+        feed(&mut g, &mut vt, "a\x1b]2;t\x1b\\b");
+        assert!(!vt.bell);
+        feed(&mut g, &mut vt, "\x07");
+        assert!(vt.bell);
+        assert_eq!(row_text(&g, 0), "ab");
+    }
+
+    #[test]
+    fn osc52_clipboard() {
+        let mut g = Grid::new(10, 2, 0);
+        let mut vt = Vt::new();
+        // "hello, wörld"
+        feed(&mut g, &mut vt, "\x1b]52;c;aGVsbG8sIHfDtnJsZA==\x07");
+        assert_eq!(vt.clipboard.as_deref(), Some("hello, wörld"));
+        // Other selections, no padding, ST terminator.
+        feed(&mut g, &mut vt, "\x1b]52;p;aGk\x1b\\");
+        assert_eq!(vt.clipboard.as_deref(), Some("hi"));
+        // Queries and garbage are ignored.
+        feed(&mut g, &mut vt, "\x1b]52;c;?\x07\x1b]52;c;not*base64\x07");
+        assert_eq!(vt.clipboard.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        assert_eq!(base64_decode(b"").unwrap(), b"");
+        assert_eq!(base64_decode(b"Zg==").unwrap(), b"f");
+        assert_eq!(base64_decode(b"Zm8=").unwrap(), b"fo");
+        assert_eq!(base64_decode(b"Zm9v").unwrap(), b"foo");
+        assert_eq!(base64_decode(b"Zm9vYg").unwrap(), b"foob");
+        assert_eq!(base64_decode(b"+/+/").unwrap(), [0xfb, 0xff, 0xbf]);
+        assert_eq!(base64_decode(b"Zm9vY"), None);
+        assert_eq!(base64_decode(b"Zm=v"), None);
+    }
+
+    #[test]
+    fn working_directory() {
+        let mut g = Grid::new(10, 2, 0);
+        let mut vt = Vt::new();
+        feed(
+            &mut g,
+            &mut vt,
+            "\x1b]7;file://box/C:/Users/me/My%20Docs\x07",
+        );
+        assert_eq!(vt.cwd.as_deref(), Some(r"C:\Users\me\My Docs"));
+        feed(&mut g, &mut vt, "\x1b]7;file:///d:/\x1b\\");
+        assert_eq!(vt.cwd.as_deref(), Some(r"d:\"));
+        feed(&mut g, &mut vt, "\x1b]7;file:///E:\x07");
+        assert_eq!(vt.cwd.as_deref(), Some(r"E:\"));
+        feed(&mut g, &mut vt, "\x1b]7;file://host/home/me/a;b\x07");
+        assert_eq!(vt.cwd.as_deref(), Some("/home/me/a;b"));
+        feed(&mut g, &mut vt, "\x1b]9;9;\"C:\\Program Files\"\x07");
+        assert_eq!(vt.cwd.as_deref(), Some(r"C:\Program Files"));
+        feed(&mut g, &mut vt, "\x1b]9;9;D:\\src\x07");
+        assert_eq!(vt.cwd.as_deref(), Some(r"D:\src"));
+        // Not a file URL, or a plain OSC 9 notification: ignored.
+        feed(&mut g, &mut vt, "\x1b]7;http://x/y\x07\x1b]9;hello\x07");
+        assert_eq!(vt.cwd.as_deref(), Some(r"D:\src"));
     }
 }

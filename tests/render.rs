@@ -1,10 +1,12 @@
 //! Renders a grid offscreen and checks the pixels. Needs a GPU adapter (a
 //! software one such as lavapipe or WARP is fine); skips when none exists.
-//! Set TACOTERM_SNAPSHOT=path.png to save the frame for a look.
+//! Set TACOTERM_SNAPSHOT=path.png (or TACOTERM_SNAPSHOT_TABS for the tabs
+//! and splits frame) to save the frame for a look.
 
 use tacoterm::config::Config;
 use tacoterm::grid::Grid;
-use tacoterm::renderer::{Fonts, Renderer};
+use tacoterm::layout::{Layout, Rect, Split};
+use tacoterm::renderer::{Fonts, Frame, PaneView, Renderer, SearchBar};
 use tacoterm::vt::Vt;
 
 #[test]
@@ -38,20 +40,12 @@ fn renders_text_colors_cursor_and_selection() {
     );
     grid.start_selection(grid.viewport_point(0, 3));
     grid.extend_selection(grid.viewport_point(8, 3));
-    assert!(renderer.render(&grid));
+    let full = Rect::new(0.0, 0.0, w as f32, h as f32);
+    assert!(renderer.render(&Frame::single(&grid, full)));
     let pixels = renderer.read_pixels().unwrap();
     assert_eq!(pixels.len(), (w * h * 4) as usize);
 
-    if let Ok(path) = std::env::var("TACOTERM_SNAPSHOT") {
-        let file = std::fs::File::create(path).unwrap();
-        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        enc.write_header()
-            .unwrap()
-            .write_image_data(&pixels)
-            .unwrap();
-    }
+    save_snapshot("TACOTERM_SNAPSHOT", &pixels, w, h);
 
     let px = |x: u32, y: u32| {
         let i = ((y * w + x) * 4) as usize;
@@ -82,4 +76,104 @@ fn renders_text_colors_cursor_and_selection() {
     // Block cursor after "> " on row 4.
     let (x, y) = at(2, 4);
     assert_eq!(px(x, y), (0xcc, 0xcc, 0xcc));
+}
+
+#[test]
+fn renders_tabs_splits_search_and_box_drawing() {
+    let config = Config {
+        color_scheme: "campbell".into(),
+        padding: 2,
+        ..Config::default()
+    };
+    let fonts = Fonts::new(&config, 1.0);
+    let (cw, ch) = (fonts.cell_width, fonts.cell_height);
+    let bar = fonts.tab_bar_height();
+    let (w, h) = (60 * cw, 10 * ch + bar);
+    let mut renderer = match Renderer::headless(w, h, fonts, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let area = Rect::new(0.0, bar as f32, w as f32, (h - bar) as f32);
+    let mut layout = Layout::new(1);
+    assert!(layout.split(1, Split::Right, 2));
+    let gap = renderer.divider_width() as f32;
+    let rects = layout.rects(area, gap);
+    let mut grids: Vec<Grid> = rects
+        .iter()
+        .map(|(_, r)| {
+            let (c, rows) = renderer.pane_grid_size(*r);
+            Grid::new(c as usize, rows as usize, 100)
+        })
+        .collect();
+    let mut vt = Vt::new();
+    vt.advance(&mut grids[0], "──────\r\nfind me here\r\n".as_bytes());
+    vt.advance(&mut grids[1], "right pane".as_bytes());
+    let matches = grids[0].search("me", false);
+    assert_eq!(matches.len(), 1);
+    let frame = Frame {
+        panes: rects
+            .iter()
+            .zip(&grids)
+            .enumerate()
+            .map(|(i, ((_, r), g))| PaneView {
+                grid: g,
+                rect: *r,
+                focused: i == 0,
+                matches: if i == 0 { &matches } else { &[] },
+                current_match: Some(0),
+                link: None,
+            })
+            .collect(),
+        dividers: layout.dividers(area, gap),
+        tabs: vec!["PowerShell".into(), "Command Prompt".into()],
+        active_tab: 0,
+        search: Some(SearchBar {
+            query: "me",
+            current: Some(0),
+            total: 1,
+        }),
+        cursor_on: true,
+        flash: false,
+    };
+    assert!(renderer.render(&frame));
+    let pixels = renderer.read_pixels().unwrap();
+    save_snapshot("TACOTERM_SNAPSHOT_TABS", &pixels, w, h);
+    let px = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        (pixels[i], pixels[i + 1], pixels[i + 2])
+    };
+    let bg = (0x0c, 0x0c, 0x0c);
+    // The box-drawing line is unbroken across the cell boundary.
+    let pad = 2;
+    let y0 = bar + pad;
+    let lit_row = (y0..y0 + ch)
+        .find(|&y| px(pad + cw / 2, y) != bg)
+        .expect("line drawn");
+    for x in pad..pad + 6 * cw {
+        assert_ne!(px(x, lit_row), bg, "gap in ─ line at x={x}");
+    }
+    // The strip right of the tabs is darker than the active tab...
+    let strip = px(w - 2, bar / 2);
+    assert!(
+        strip.0 <= bg.0 && strip != px(w / 4, bar / 2),
+        "strip {strip:?}"
+    );
+    // ...and the divider between the panes is drawn.
+    let d = layout.dividers(area, gap)[0];
+    assert_ne!(px(d.x as u32, (d.y + d.h / 2.0) as u32), bg);
+}
+
+fn save_snapshot(var: &str, pixels: &[u8], w: u32, h: u32) {
+    let Ok(path) = std::env::var(var) else { return };
+    let file = std::fs::File::create(path).unwrap();
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(pixels)
+        .unwrap();
 }

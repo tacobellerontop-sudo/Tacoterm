@@ -32,6 +32,25 @@ pub struct Config {
     pub right_click: String,
     /// `block`, `bar` or `underline`.
     pub cursor_style: String,
+    pub cursor_blink: bool,
+    /// How solid the background is, 0.0 (clear) to 1.0 (solid).
+    pub opacity: f32,
+    /// What shows through a see-through background on Windows 11:
+    /// `none`, `acrylic` (blurred), `mica` (wallpaper tint) or `tabbed`.
+    pub backdrop: String,
+    /// BEL from a program: `visual` (flash), `sound`, `both` or `none`.
+    /// Unfocused windows also flash in the taskbar.
+    pub bell: String,
+    /// Copy to the clipboard as soon as a selection is made.
+    pub copy_on_select: bool,
+    /// `always`, `multiple` (only with two or more tabs) or `never`.
+    pub tab_bar: String,
+    /// Global hotkey that shows/hides tacoterm from anywhere, e.g.
+    /// `win+\``; empty disables.
+    pub summon_hotkey: String,
+    /// Drop down from the top of the screen like a Quake console when
+    /// summoned.
+    pub quake_mode: bool,
     /// One of the built-in schemes in [`crate::schemes`].
     pub color_scheme: String,
     /// Per-color overrides on top of the scheme.
@@ -57,10 +76,30 @@ pub struct ThemeOverrides {
 pub struct Keybindings {
     pub copy: String,
     pub paste: String,
+    pub select_all: String,
+    pub find: String,
     pub scroll_page_up: String,
     pub scroll_page_down: String,
     pub scroll_to_top: String,
     pub scroll_to_bottom: String,
+    pub new_tab: String,
+    pub close_pane: String,
+    pub next_tab: String,
+    pub previous_tab: String,
+    pub split_right: String,
+    pub split_down: String,
+    pub focus_left: String,
+    pub focus_right: String,
+    pub focus_up: String,
+    pub focus_down: String,
+    pub resize_left: String,
+    pub resize_right: String,
+    pub resize_up: String,
+    pub resize_down: String,
+    pub zoom_in: String,
+    pub zoom_out: String,
+    pub zoom_reset: String,
+    pub fullscreen: String,
     pub next_color_scheme: String,
     pub open_settings: String,
 }
@@ -77,6 +116,14 @@ impl Default for Config {
             prompt: "arrow".to_string(),
             right_click: "menu".to_string(),
             cursor_style: "block".to_string(),
+            cursor_blink: true,
+            opacity: 1.0,
+            backdrop: "none".to_string(),
+            bell: "visual".to_string(),
+            copy_on_select: false,
+            tab_bar: "always".to_string(),
+            summon_hotkey: "win+`".to_string(),
+            quake_mode: false,
             color_scheme: "tokyo-night".to_string(),
             theme: ThemeOverrides::default(),
             keybindings: Keybindings::default(),
@@ -89,23 +136,48 @@ impl Default for Keybindings {
         Keybindings {
             copy: "ctrl+shift+c".to_string(),
             paste: "ctrl+shift+v".to_string(),
+            select_all: "ctrl+shift+a".to_string(),
+            find: "ctrl+shift+f".to_string(),
             scroll_page_up: "shift+pageup".to_string(),
             scroll_page_down: "shift+pagedown".to_string(),
             scroll_to_top: "ctrl+shift+home".to_string(),
             scroll_to_bottom: "ctrl+shift+end".to_string(),
-            next_color_scheme: "ctrl+shift+t".to_string(),
+            new_tab: "ctrl+shift+t".to_string(),
+            close_pane: "ctrl+shift+w".to_string(),
+            next_tab: "ctrl+tab".to_string(),
+            previous_tab: "ctrl+shift+tab".to_string(),
+            split_right: "alt+shift+=".to_string(),
+            split_down: "alt+shift+-".to_string(),
+            focus_left: "alt+left".to_string(),
+            focus_right: "alt+right".to_string(),
+            focus_up: "alt+up".to_string(),
+            focus_down: "alt+down".to_string(),
+            resize_left: "alt+shift+left".to_string(),
+            resize_right: "alt+shift+right".to_string(),
+            resize_up: "alt+shift+up".to_string(),
+            resize_down: "alt+shift+down".to_string(),
+            zoom_in: "ctrl+=".to_string(),
+            zoom_out: "ctrl+-".to_string(),
+            zoom_reset: "ctrl+0".to_string(),
+            fullscreen: "f11".to_string(),
+            next_color_scheme: "ctrl+shift+n".to_string(),
             open_settings: "ctrl+,".to_string(),
         }
     }
 }
 
 /// The `arrow` prompt for cmd.exe: blue path, green arrow, in palette
-/// colors so it follows the scheme.
-pub const ARROW_PROMPT: &str = "$E[1;34m$P$E[0m $E[32m❯$E[0m ";
+/// colors so it follows the scheme. It also reports the directory
+/// (`OSC 9;9`) so new tabs and splits open where you are.
+pub const ARROW_PROMPT: &str = "$E]9;9;$P$E\\$E[1;34m$P$E[0m $E[32m❯$E[0m ";
+
+/// The first `arrow` prompt, before it reported the directory; files that
+/// spelled it out mean `arrow`.
+const OLD_ARROW_PROMPT: &str = "$E[1;34m$P$E[0m $E[32m❯$E[0m ";
 
 /// The `arrow` prompt for PowerShell, installed only when the profile
 /// hasn't set a prompt of its own (oh-my-posh, starship… win).
-pub const POWERSHELL_ARROW_PROMPT: &str = "if ((Get-Item function:prompt).ScriptBlock.ToString() -match 'executionContext\\.SessionState\\.Path\\.CurrentLocation') { function global:prompt { $e = [char]27; \"$e[1;34m$($executionContext.SessionState.Path.CurrentLocation)$e[0m $e[32m$([char]0x276F)$e[0m \" } }";
+pub const POWERSHELL_ARROW_PROMPT: &str = "if ((Get-Item function:prompt).ScriptBlock.ToString() -match 'executionContext\\.SessionState\\.Path\\.CurrentLocation') { function global:prompt { $e = [char]27; \"$e]9;9;$($executionContext.SessionState.Path.CurrentLocation)$e\\$e[1;34m$($executionContext.SessionState.Path.CurrentLocation)$e[0m $e[32m$([char]0x276F)$e[0m \" } }";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -231,6 +303,22 @@ pub struct Theme {
     pub palette: [Rgb; 16],
 }
 
+/// See-through background material (Windows 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backdrop {
+    None,
+    Acrylic,
+    Mica,
+    Tabbed,
+}
+
+/// What a BEL does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bell {
+    pub flash: bool,
+    pub sound: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorStyle {
     Block,
@@ -308,7 +396,9 @@ impl Config {
         };
         let prompt = self.prompt.trim();
         // The old starter file spelled `arrow` out as cmd PROMPT codes.
-        let arrow = prompt.eq_ignore_ascii_case("arrow") || prompt == ARROW_PROMPT.trim();
+        let arrow = prompt.eq_ignore_ascii_case("arrow")
+            || prompt == ARROW_PROMPT.trim()
+            || prompt == OLD_ARROW_PROMPT.trim();
         let classic = prompt.is_empty() || prompt.eq_ignore_ascii_case("classic");
         let mut env = Vec::new();
         match ShellKind::of(&command) {
@@ -340,9 +430,72 @@ impl Config {
         }
     }
 
+    pub fn backdrop(&self) -> Backdrop {
+        match self.backdrop.trim().to_lowercase().as_str() {
+            "acrylic" | "blur" => Backdrop::Acrylic,
+            "mica" => Backdrop::Mica,
+            "tabbed" | "mica-alt" => Backdrop::Tabbed,
+            _ => Backdrop::None,
+        }
+    }
+
+    pub fn bell(&self) -> Bell {
+        match self.bell.trim().to_lowercase().as_str() {
+            "none" | "off" => Bell {
+                flash: false,
+                sound: false,
+            },
+            "sound" | "audible" => Bell {
+                flash: false,
+                sound: true,
+            },
+            "both" => Bell {
+                flash: true,
+                sound: true,
+            },
+            _ => Bell {
+                flash: true,
+                sound: false,
+            },
+        }
+    }
+
     /// Everything wrong with this config that parsing alone doesn't catch.
     pub fn warnings(&self) -> Vec<String> {
         let mut w = self.theme().1;
+        if !(0.0..=1.0).contains(&self.opacity) {
+            w.push(format!(
+                "opacity {}: use a number from 0.0 (clear) to 1.0 (solid)",
+                self.opacity
+            ));
+        }
+        let backdrop = self.backdrop.trim().to_lowercase();
+        if !matches!(
+            backdrop.as_str(),
+            "none" | "" | "acrylic" | "blur" | "mica" | "tabbed" | "mica-alt"
+        ) {
+            w.push(format!(
+                "backdrop \"{}\": use none, acrylic, mica or tabbed",
+                self.backdrop
+            ));
+        }
+        let tab_bar = self.tab_bar.trim().to_lowercase();
+        if !matches!(tab_bar.as_str(), "always" | "multiple" | "auto" | "never") {
+            w.push(format!(
+                "tab_bar \"{}\": use always, multiple or never",
+                self.tab_bar
+            ));
+        }
+        let bell = self.bell.trim().to_lowercase();
+        if !matches!(
+            bell.as_str(),
+            "visual" | "flash" | "sound" | "audible" | "both" | "none" | "off"
+        ) {
+            w.push(format!(
+                "bell \"{}\": use visual, sound, both or none",
+                self.bell
+            ));
+        }
         let style = self.cursor_style.trim().to_lowercase();
         if !matches!(
             style.as_str(),
@@ -369,15 +522,31 @@ pub const STARTER_TOML: &str = r##"# tacoterm settings. Right-click in tacoterm 
 
 # Built-in schemes: tokyo-night, catppuccin-mocha, dracula, one-half-dark,
 # gruvbox-dark, nord, solarized-dark, one-half-light, campbell.
-# Ctrl+Shift+T cycles through them to preview.
+# Ctrl+Shift+N cycles through them to preview.
 color_scheme = "tokyo-night"
 
 font_family = "Cascadia Mono"
-font_size = 14.0
+font_size = 14.0            # Ctrl+= / Ctrl+- / Ctrl+0 zoom for now
 line_height = 1.25          # multiple of font_size
 padding = 10                # pixels around the text
 cursor_style = "block"      # block, bar or underline
+cursor_blink = true
 scrollback_lines = 10000
+
+# See-through background: 1.0 is solid, 0.8 lets the desktop show through.
+opacity = 1.0
+# Windows 11 material behind it: "none", "acrylic" (frosted glass),
+# "mica" or "tabbed". Pair acrylic with opacity = 0.6 or so.
+backdrop = "none"
+
+bell = "visual"             # visual, sound, both or none
+copy_on_select = false
+tab_bar = "always"          # always, multiple (2+ tabs) or never
+
+# Press this anywhere in Windows to show or hide tacoterm. quake_mode makes
+# it drop down from the top of the screen instead. (Both apply on restart.)
+summon_hotkey = "win+`"
+quake_mode = false
 
 # "auto" starts PowerShell (7 if installed). Or any command line:
 # "cmd.exe", "wsl.exe ~", "C:\\Program Files\\Git\\bin\\bash.exe -i -l"
@@ -388,7 +557,7 @@ shell = "auto"
 # cmd.exe PROMPT string ($P path, $G >, $_ new line, $E[32m colors).
 prompt = "arrow"
 
-# "menu": right-click shows Copy, Paste, color schemes, shell and settings.
+# "menu": right-click shows Copy, Paste, tabs, panes and settings.
 # "paste": right-click copies a selection or pastes, like the old console.
 right_click = "menu"
 
@@ -403,15 +572,37 @@ right_click = "menu"
 #            "#414868", "#f7768e", "#9ece6a", "#e0af68",
 #            "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"]
 
-# Mouse: drag to select, right-click copies a selection or pastes.
+# Mouse: drag to select, double-click a word, triple-click a line,
+# Ctrl+click a link, Ctrl+wheel zooms, Shift+drag selects inside apps that
+# use the mouse. An empty string unbinds a key.
 [keybindings]
 copy = "ctrl+shift+c"
 paste = "ctrl+shift+v"
+select_all = "ctrl+shift+a"
+find = "ctrl+shift+f"
 scroll_page_up = "shift+pageup"
 scroll_page_down = "shift+pagedown"
 scroll_to_top = "ctrl+shift+home"
 scroll_to_bottom = "ctrl+shift+end"
-next_color_scheme = "ctrl+shift+t"
+new_tab = "ctrl+shift+t"
+close_pane = "ctrl+shift+w"
+next_tab = "ctrl+tab"
+previous_tab = "ctrl+shift+tab"
+split_right = "alt+shift+="
+split_down = "alt+shift+-"
+focus_left = "alt+left"
+focus_right = "alt+right"
+focus_up = "alt+up"
+focus_down = "alt+down"
+resize_left = "alt+shift+left"
+resize_right = "alt+shift+right"
+resize_up = "alt+shift+up"
+resize_down = "alt+shift+down"
+zoom_in = "ctrl+="
+zoom_out = "ctrl+-"
+zoom_reset = "ctrl+0"
+fullscreen = "f11"
+next_color_scheme = "ctrl+shift+n"
 open_settings = "ctrl+,"
 "##;
 
@@ -420,15 +611,26 @@ open_settings = "ctrl+,"
 const OLD_STARTER_SHELL: &str =
     "shell = \"C:\\\\Windows\\\\System32\\\\cmd.exe\"   # or \"pwsh.exe -NoLogo\", \"wsl.exe ~\"";
 
+/// Ctrl+Shift+T cycled color schemes before tabs existed; it opens a tab
+/// now.
+const OLD_SCHEME_KEY: &str = "next_color_scheme = \"ctrl+shift+t\"";
+const OLD_SCHEME_COMMENT: &str = "# Ctrl+Shift+T cycles through them to preview.";
+
+/// Update lines older starter files wrote that mean something else now.
 fn migrate(path: &std::path::Path, text: String) -> String {
-    if !text.contains(OLD_STARTER_SHELL) {
-        return text;
+    let new = text
+        .replace(
+            OLD_STARTER_SHELL,
+            "shell = \"auto\"   # PowerShell; or \"cmd.exe\", \"wsl.exe ~\", any command line",
+        )
+        .replace(OLD_SCHEME_KEY, "next_color_scheme = \"ctrl+shift+n\"")
+        .replace(
+            OLD_SCHEME_COMMENT,
+            "# Ctrl+Shift+N cycles through them to preview.",
+        );
+    if new != text {
+        let _ = std::fs::write(path, &new);
     }
-    let new = text.replace(
-        OLD_STARTER_SHELL,
-        "shell = \"auto\"   # PowerShell; or \"cmd.exe\", \"wsl.exe ~\", any command line",
-    );
-    let _ = std::fs::write(path, &new);
     new
 }
 
@@ -589,6 +791,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let migrated = migrate(&dir.join("config.toml"), old);
         assert_eq!(parse(&migrated).unwrap().shell, "auto");
+        let old = STARTER_TOML.replace("next_color_scheme = \"ctrl+shift+n\"", OLD_SCHEME_KEY);
+        let migrated = parse(&migrate(&dir.join("config.toml"), old)).unwrap();
+        assert_eq!(migrated.keybindings.next_color_scheme, "ctrl+shift+n");
         let _ = std::fs::remove_dir_all(dir);
     }
 

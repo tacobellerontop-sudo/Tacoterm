@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 
-use windows::core::PWSTR;
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
@@ -45,8 +45,8 @@ fn pipe() -> io::Result<(HANDLE, HANDLE)> {
 
 impl Pty {
     /// Spawn `shell` (e.g. `C:\Windows\System32\cmd.exe`) on a new
-    /// pseudo-console of `cols`×`rows`.
-    pub fn spawn(shell: &str, cols: u16, rows: u16) -> io::Result<Pty> {
+    /// pseudo-console of `cols`×`rows`, starting in `cwd` if given.
+    pub fn spawn(shell: &str, cols: u16, rows: u16, cwd: Option<&str>) -> io::Result<Pty> {
         unsafe {
             // Two pipes: we write stdin, the console reads it; the console
             // writes stdout, we read it.
@@ -114,6 +114,10 @@ impl Pty {
 
             // CreateProcessW wants a *mutable* UTF-16 buffer.
             let mut cmd: Vec<u16> = OsStr::new(shell).encode_wide().chain([0]).collect();
+            let dir = cwd
+                .filter(|d| std::path::Path::new(d).is_dir())
+                .map(HSTRING::from);
+            let dir_ptr = dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr()));
             let mut pi = PROCESS_INFORMATION::default();
             let spawned = CreateProcessW(
                 None,
@@ -123,7 +127,7 @@ impl Pty {
                 false,
                 EXTENDED_STARTUPINFO_PRESENT,
                 None,
-                None,
+                dir_ptr,
                 std::ptr::addr_of_mut!(si_ex).cast::<STARTUPINFOW>(),
                 &mut pi,
             );

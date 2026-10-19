@@ -13,6 +13,8 @@ mod app;
 mod menu;
 #[cfg(windows)]
 mod pty;
+#[cfg(windows)]
+mod win;
 
 #[cfg(windows)]
 fn main() {

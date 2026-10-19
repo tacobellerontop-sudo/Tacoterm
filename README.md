@@ -6,20 +6,33 @@ The real console lives in a Windows pseudo-console (ConPTY); tacoterm is a fast
 window onto it. `cmd.exe`, PowerShell and WSL all just work, because from their
 side nothing is unusual — they talk to a console, as always.
 
-## Status: MVP
+## Features
 
-One resizable window onto PowerShell (the default), `cmd.exe` or WSL, drawn on the GPU:
+Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on the GPU:
 
-- ConPTY spawn / resize / teardown; the window closes when the shell exits
+- **Tabs**: Ctrl+Shift+T opens one (in the current folder), Ctrl+Tab /
+  Ctrl+Shift+Tab switch, click the tab strip, middle-click or × closes
+- **Split panes**: Alt+Shift+= splits right, Alt+Shift+- splits down,
+  Alt+arrows move between panes, Alt+Shift+arrows resize, Ctrl+Shift+W closes
+- **Transparency**: `opacity` plus Windows 11 acrylic / mica backgrounds
+  (right-click → Opacity / Background effect)
+- **Find in scrollback**: Ctrl+Shift+F; Enter / Shift+Enter step through hits
+- **Links**: Ctrl+click a URL to open it (it underlines while Ctrl is held)
+- **Mouse**: drag, double-click a word, triple-click a line, Shift+click
+  extends; apps like vim, htop and tmux get mouse events (hold Shift to
+  select instead)
+- **Zoom** with Ctrl+= / Ctrl+- / Ctrl+0 or Ctrl+wheel; **full screen** with F11
+- **Summon hotkey**: Win+` shows or hides tacoterm from anywhere;
+  `quake_mode = true` drops it down from the top of the screen
+- Blinking cursor shapes (and apps can change them), visual or audible bell,
+  apps can copy to the clipboard (OSC 52)
+- Text rewraps when the window is resized
+- Box-drawing and block characters drawn to tile without gaps
 - VT parsing for what ConPTY and full-screen apps emit: cursor movement,
   erase, insert/delete, scroll regions, alternate screen, SGR (16 / 256 /
-  truecolor), bold / italic / underline / strikethrough, titles, status
-  reports, bracketed paste, application cursor keys
+  truecolor), titles, status reports, bracketed paste, focus events
 - Wide characters (CJK, emoji) and font fallback via cosmic-text
-- Scrollback (mouse wheel, Shift+PgUp/PgDn, Ctrl+Shift+Home/End)
-- Copy / paste: drag to select; Ctrl+Shift+C / Ctrl+Shift+V, or the right-click menu
-- Built-in color schemes, cursor styles and a colored cmd prompt
-- `config.toml` settings that apply live when saved
+- Built-in color schemes and a colored prompt; `config.toml` applies live
 - Per-monitor DPI scaling
 
 ## Build (Windows)
@@ -33,12 +46,13 @@ parser, renderer, config, key mapping) is a portable library, so
 `cargo test` runs anywhere; the render test draws a frame offscreen and
 checks its pixels (it skips when no GPU adapter, not even a software one,
 is available). `TACOTERM_SNAPSHOT=frame.png cargo test --test render` saves
-that frame.
+that frame (`TACOTERM_SNAPSHOT_TABS` saves the tabs-and-splits one).
 
 ## Settings
 
-**Right-click** anywhere in tacoterm for Copy, Paste, the color scheme, the
-shell (PowerShell, Command Prompt, WSL) and **All settings…**, which opens
+**Right-click** anywhere in tacoterm for tabs, splits, find, copy/paste,
+the color scheme, opacity, background effect, the shell (PowerShell,
+Command Prompt, WSL), full screen and **All settings…**, which opens
 `%APPDATA%\tacoterm\config.toml` in Notepad (so does Ctrl+,). Save that
 file and colors, fonts, cursor and keybindings apply right away; shell and
 prompt apply to the next shell. Every key is optional, and a mistake shows
@@ -47,11 +61,13 @@ a warning and falls back to the default.
 ```toml
 # tokyo-night, catppuccin-mocha, dracula, one-half-dark, gruvbox-dark,
 # nord, solarized-dark, one-half-light, campbell
-color_scheme = "tokyo-night"     # Ctrl+Shift+T previews the next one
+color_scheme = "tokyo-night"     # Ctrl+Shift+N previews the next one
 cursor_style = "bar"             # block, bar or underline
 font_family = "Cascadia Mono"    # falls back to Consolas, then others
 font_size = 14.0
 padding = 10
+opacity = 0.85                   # 1.0 is solid
+backdrop = "acrylic"             # none, acrylic, mica or tabbed (Windows 11)
 
 shell = "auto"                   # PowerShell; or "cmd.exe", "wsl.exe ~", …
 prompt = "arrow"                 # path + ❯; "classic" = the shell's own
@@ -63,33 +79,40 @@ background = "#101010"
 [keybindings]
 copy = "ctrl+shift+c"
 paste = "ctrl+shift+v"
+new_tab = "ctrl+shift+t"
+split_right = "alt+shift+="
+find = "ctrl+shift+f"
 ```
+
+The file tacoterm writes on first run lists every key and binding.
 
 ## Layout
 
 | File | What it holds |
 | --- | --- |
 | `src/main.rs` | Entry point (Windows binary) |
-| `src/app.rs` | winit event loop, PTY threads, mouse/keyboard, clipboard |
+| `src/app.rs` | winit event loop, tabs and panes, mouse/keyboard, find |
+| `src/menu.rs` | The right-click menu |
+| `src/win.rs` | Win32 bits: summon hotkey, backdrop, links, beep |
 | `src/pty.rs` | ConPTY wrapper: spawn, resize, write, exit watch |
 | `src/lib.rs` | The portable terminal core |
 | `src/vt.rs` | `vte` parser → grid |
-| `src/grid.rs` | Screen, scrollback, alternate screen, selection |
+| `src/grid.rs` | Screen, scrollback, reflow, selection, search, links |
 | `src/input.rs` | Key events → VT bytes; keybinding matching |
-| `src/renderer.rs` | wgpu renderer with a cosmic-text glyph atlas |
+| `src/mouse.rs` | Mouse reporting encodings |
+| `src/layout.rs` | Split-pane tree |
+| `src/boxdraw.rs` | Pixel-exact box-drawing and block glyphs |
+| `src/renderer.rs` | wgpu renderer: panes, tab strip, find box, glyph atlas |
 | `src/config.rs` | TOML settings, written on first run |
 | `src/schemes.rs` | Built-in color schemes |
 
 ## Roadmap
 
-- [x] ConPTY spawn / resize / teardown
-- [x] VT parsing, grid, scrollback, alternate screen
-- [x] Renderer: glyph atlas, instanced quads, redraw only on change
-- [x] Selection, copy / paste, config file, keybindings
-- [ ] Per-row damage tracking, built-in box-drawing glyphs
-- [ ] Reflow on resize, mouse reporting, OSC 52 / OSC 8
-- [ ] Tabs, splits, find in scrollback
-- [ ] Themes, quake-mode dropdown, URL hints
+- [x] ConPTY, VT parsing, grid, scrollback, alternate screen
+- [x] GPU renderer, box drawing, transparency
+- [x] Tabs, splits, find, links, mouse reporting, reflow, quake mode
+- [ ] Per-row damage tracking, OSC 8 hyperlinks, dragging pane dividers
+- [ ] A shell of our own
 
 ## License
 

@@ -147,10 +147,24 @@ fn control_code(c: char) -> Option<u8> {
 pub enum Action {
     Copy,
     Paste,
+    SelectAll,
+    Find,
     ScrollPageUp,
     ScrollPageDown,
     ScrollToTop,
     ScrollToBottom,
+    NewTab,
+    ClosePane,
+    NextTab,
+    PreviousTab,
+    SplitRight,
+    SplitDown,
+    Focus(crate::layout::Direction),
+    Resize(crate::layout::Direction),
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    Fullscreen,
     NextColorScheme,
     OpenSettings,
 }
@@ -187,7 +201,16 @@ impl KeyCombo {
         if key.is_empty() {
             return Err(format!("no key in `{s}`"));
         }
-        combo.key = key.clone();
+        combo.key = match key.as_str() {
+            "plus" => "+".to_string(),
+            "minus" => "-".to_string(),
+            "esc" => "escape".to_string(),
+            "return" => "enter".to_string(),
+            "comma" => ",".to_string(),
+            "period" => ".".to_string(),
+            "backtick" | "grave" => "`".to_string(),
+            _ => key.clone(),
+        };
         Ok(combo)
     }
 
@@ -227,13 +250,34 @@ impl Bindings {
     pub fn from_config(kb: &crate::config::Keybindings) -> (Bindings, Vec<String>) {
         let mut out = Vec::new();
         let mut errors = Vec::new();
+        use crate::layout::Direction::*;
         for (combo, action) in [
             (&kb.copy, Action::Copy),
             (&kb.paste, Action::Paste),
+            (&kb.select_all, Action::SelectAll),
+            (&kb.find, Action::Find),
             (&kb.scroll_page_up, Action::ScrollPageUp),
             (&kb.scroll_page_down, Action::ScrollPageDown),
             (&kb.scroll_to_top, Action::ScrollToTop),
             (&kb.scroll_to_bottom, Action::ScrollToBottom),
+            (&kb.new_tab, Action::NewTab),
+            (&kb.close_pane, Action::ClosePane),
+            (&kb.next_tab, Action::NextTab),
+            (&kb.previous_tab, Action::PreviousTab),
+            (&kb.split_right, Action::SplitRight),
+            (&kb.split_down, Action::SplitDown),
+            (&kb.focus_left, Action::Focus(Left)),
+            (&kb.focus_right, Action::Focus(Right)),
+            (&kb.focus_up, Action::Focus(Up)),
+            (&kb.focus_down, Action::Focus(Down)),
+            (&kb.resize_left, Action::Resize(Left)),
+            (&kb.resize_right, Action::Resize(Right)),
+            (&kb.resize_up, Action::Resize(Up)),
+            (&kb.resize_down, Action::Resize(Down)),
+            (&kb.zoom_in, Action::ZoomIn),
+            (&kb.zoom_out, Action::ZoomOut),
+            (&kb.zoom_reset, Action::ZoomReset),
+            (&kb.fullscreen, Action::Fullscreen),
             (&kb.next_color_scheme, Action::NextColorScheme),
             (&kb.open_settings, Action::OpenSettings),
         ] {
@@ -344,6 +388,24 @@ mod tests {
             b.lookup(&ch(","), ModifiersState::CONTROL),
             Some(Action::OpenSettings)
         );
+        assert_eq!(
+            b.lookup(&ch("t"), cs),
+            Some(Action::NewTab),
+            "new tab owns ctrl+shift+t"
+        );
+        assert_eq!(
+            b.lookup(&Key::Named(NamedKey::Tab), ModifiersState::CONTROL),
+            Some(Action::NextTab)
+        );
+        assert_eq!(
+            b.lookup(&ch("="), ModifiersState::ALT | ModifiersState::SHIFT),
+            Some(Action::SplitRight)
+        );
+        assert_eq!(
+            b.lookup(&Key::Named(NamedKey::F11), NONE),
+            Some(Action::Fullscreen)
+        );
+        assert_eq!(KeyCombo::parse("alt+shift+plus").unwrap().key, "+");
         assert!(KeyCombo::parse("hyper+x").is_err());
     }
 }

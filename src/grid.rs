@@ -37,6 +37,10 @@ impl Attr {
     pub const WIDE: u16 = 1 << 8;
     /// Second half of a double-width character: draws nothing itself.
     pub const WIDE_SPACER: u16 = 1 << 9;
+    /// Blank left in the last column of a wrapped row because the wide
+    /// character after it didn't fit. Not part of the text: copying, search
+    /// and reflow skip it.
+    pub const WIDE_PAD: u16 = 1 << 10;
 
     pub fn set(&mut self, flag: u16, on: bool) {
         if on {
@@ -126,6 +130,17 @@ pub struct Modes {
     pub app_cursor: bool,
     /// ?2004: wrap pastes in `ESC [200~` … `ESC [201~`.
     pub bracketed_paste: bool,
+    /// Which mouse events the program wants reported (?9 / ?1000 / ?1002 / ?1003).
+    pub mouse: MouseMode,
+    /// ?1006: report mouse events in SGR form (`ESC [ < b ; x ; y M`).
+    pub mouse_sgr: bool,
+    /// ?1004: send `ESC [ I` / `ESC [ O` when the window gains / loses focus.
+    pub focus_events: bool,
+    /// ?2026: synchronized output. Tracked only; rendering ignores it.
+    pub sync_output: bool,
+    /// DECSCUSR (`CSI Ps SP q`): the program's cursor shape and whether it
+    /// blinks. `None` means "use the configured style".
+    pub cursor_shape: Option<(crate::config::CursorStyle, bool)>,
 }
 
 impl Default for Modes {
@@ -135,8 +150,28 @@ impl Default for Modes {
             cursor_visible: true,
             app_cursor: false,
             bracketed_paste: false,
+            mouse: MouseMode::Off,
+            mouse_sgr: false,
+            focus_events: false,
+            sync_output: false,
+            cursor_shape: None,
         }
     }
+}
+
+/// Mouse tracking level requested by the program. Each level reports
+/// everything the one before it does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MouseMode {
+    /// No reporting: the mouse belongs to the terminal (selection, scrolling).
+    #[default]
+    Off,
+    /// ?1000 (and X10's ?9): presses, releases and the wheel.
+    Click,
+    /// ?1002: also motion while a button is held.
+    Drag,
+    /// ?1003: all motion.
+    Motion,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,10 +190,21 @@ pub struct Point {
     pub col: usize,
 }
 
+/// What a selection grows by while dragging: single cells (click-drag),
+/// whole words (double-click) or whole logical lines (triple-click).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectionKind {
+    #[default]
+    Cell,
+    Word,
+    Line,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
     pub anchor: Point,
     pub head: Point,
+    pub kind: SelectionKind,
 }
 
 impl Selection {
@@ -170,6 +216,89 @@ impl Selection {
             (self.head, self.anchor)
         }
     }
+}
+
+/// A search hit, `start` and `end` inclusive. Both point at real cells:
+/// for a wide character that's its first half, never the spacer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Match {
+    pub start: Point,
+    pub end: Point,
+}
+
+/// Whether `p` lies inside one of `matches` (sorted and non-overlapping, as
+/// [`Grid::search`] returns them). For the spacer half of a wide character,
+/// ask about its first half.
+pub fn is_match_cell(matches: &[Match], p: Point) -> bool {
+    let i = matches.partition_point(|m| m.start <= p);
+    i > 0 && matches[i - 1].end >= p
+}
+
+/// Characters a double-click word runs over: letters, digits and the
+/// punctuation found in paths and URLs. Spaces, brackets and quotes split.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || "_-.~/\\:@%+#?=&".contains(c)
+}
+
+/// Characters that may appear in a URL candidate. Quotes and brackets are
+/// allowed here and trimmed from the end later if unbalanced.
+fn is_url_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !c.is_control()
+        && !"<>`{}|^".contains(c)
+        // Box drawing and block elements: TUI borders, never URL text.
+        && !('\u{2500}'..='\u{259f}').contains(&c)
+}
+
+/// URL prefixes [`Grid::url_at`] recognizes, matched case-insensitively.
+const URL_PREFIXES: [&str; 6] = [
+    "https://", "http://", "file://", "ftp://", "mailto:", "www.",
+];
+
+/// The length of the URL prefix starting at `run[k]`, if there is one.
+fn url_prefix_at(run: &[char], k: usize) -> Option<&'static str> {
+    URL_PREFIXES.into_iter().find(|prefix| {
+        let n = prefix.chars().count();
+        run.len() >= k + n
+            && run[k..k + n]
+                .iter()
+                .zip(prefix.chars())
+                .all(|(a, b)| a.to_ascii_lowercase() == b)
+            // "www." only at a word start, so "awww.x" isn't a link.
+            && (*prefix != "www." || k == 0 || !run[k - 1].is_alphanumeric())
+    })
+}
+
+/// How much of `url` to keep once trailing sentence punctuation and
+/// unbalanced closing brackets/quotes are cut.
+fn trim_url_end(url: &[char]) -> usize {
+    let mut end = url.len();
+    while let Some(&c) = url[..end].last() {
+        let count = |x: char| url[..end].iter().filter(|&&y| y == x).count();
+        let unbalanced = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            ')' => count('(') < count(')'),
+            ']' => count('[') < count(']'),
+            '\'' | '"' => count(c) % 2 == 1,
+            _ => false,
+        };
+        if !unbalanced {
+            break;
+        }
+        end -= 1;
+    }
+    end
+}
+
+/// The index of the cell at `p` in a [`Grid::logical_cells`] run: the last
+/// cell at or before it, so a wide character's spacer maps to its first half.
+fn cell_index(cells: &[(Point, char)], p: Point) -> usize {
+    cells.partition_point(|&(q, _)| q <= p).saturating_sub(1)
+}
+
+/// A cell reflow may drop from the end of a logical line.
+fn is_trailing_blank(cell: &Cell) -> bool {
+    cell.c == ' ' && cell.bg == Color::Default && !cell.attr.has(Attr::INVERSE | Attr::WIDE_SPACER)
 }
 
 pub struct Grid {
@@ -283,7 +412,9 @@ impl Grid {
             if self.modes.autowrap {
                 let y = self.cursor_y;
                 self.clear_wide_at(self.cursor_x, y);
-                self.screen[y].cells[self.cursor_x] = self.blank();
+                let mut pad = self.blank();
+                pad.attr.set(Attr::WIDE_PAD, true);
+                self.screen[y].cells[self.cursor_x] = pad;
                 self.screen[y].wrapped = true;
                 self.cursor_x = 0;
                 self.line_feed();
@@ -628,16 +759,32 @@ impl Grid {
         self.selection = None;
     }
 
-    /// Resize the screen. Rows that no longer fit above the cursor move to
-    /// scrollback; columns are cut or padded.
-    /// TODO: reflow (rewrap long lines) like real terminals do. ConPTY
-    /// repaints the screen after a resize, which hides most of the gap.
+    /// Resize the screen. On the primary screen a width change reflows
+    /// scrollback and screen (see [`Grid::reflow`]). Otherwise rows that no
+    /// longer fit above the cursor move to scrollback and columns are cut or
+    /// padded — the alternate screen's app repaints on resize anyway.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
         if cols == self.cols && rows == self.rows {
             return;
         }
+        if cols != self.cols && !self.is_alt_screen() {
+            self.reflow(cols, rows);
+        } else {
+            self.cut_to(cols, rows);
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+        self.selection = None;
+        self.display_offset = self.display_offset.min(self.scrollback.len());
+    }
+
+    /// Resize without rewrapping: cut or pad columns, drop lines off the top
+    /// until the cursor fits.
+    fn cut_to(&mut self, cols: usize, rows: usize) {
         let fit = |screen: &mut Vec<Row>| {
             for row in screen.iter_mut() {
                 row.cells.resize(cols, Cell::default());
@@ -669,15 +816,134 @@ impl Grid {
             cursor.x = cursor.x.min(cols - 1);
             cursor.y = cursor.y.min(rows - 1);
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.scroll_top = 0;
-        self.scroll_bottom = rows - 1;
         self.cursor_x = self.cursor_x.min(cols - 1);
         self.cursor_y = self.cursor_y.min(rows - 1);
         self.wrap_pending = false;
-        self.selection = None;
-        self.display_offset = self.display_offset.min(self.scrollback.len());
+    }
+
+    /// Rewrap scrollback + screen to `cols` columns: rows joined by
+    /// `wrapped` become one logical line again and are split at the new
+    /// width, with trailing blanks dropped. The cursor keeps its place in
+    /// its logical line; blank rows below it are discarded, and whatever
+    /// doesn't fit in `rows` goes to scrollback.
+    fn reflow(&mut self, cols: usize, rows: usize) {
+        let cursor_row = self.scrollback.len() + self.cursor_y;
+        let old: Vec<Row> = self
+            .scrollback
+            .drain(..)
+            .chain(self.screen.drain(..))
+            .collect();
+        let mut out: Vec<Row> = Vec::new();
+        // (row in `out`, col, wrap pending)
+        let mut cursor = (0, 0, false);
+        let mut i = 0;
+        while i < old.len() {
+            // Join one logical line, noting where the cursor falls in it.
+            let mut cells: Vec<Cell> = Vec::new();
+            let mut cursor_at = None;
+            loop {
+                let row = &old[i];
+                for (x, cell) in row.cells.iter().enumerate() {
+                    if i == cursor_row && x == self.cursor_x {
+                        cursor_at = Some(cells.len() + usize::from(self.wrap_pending));
+                    }
+                    if !(row.wrapped && cell.attr.has(Attr::WIDE_PAD)) {
+                        cells.push(*cell);
+                    }
+                }
+                i += 1;
+                if !row.wrapped || i == old.len() {
+                    break;
+                }
+            }
+            let content = cells.len()
+                - cells
+                    .iter()
+                    .rev()
+                    .take_while(|c| is_trailing_blank(c))
+                    .count();
+            let n = content.max(cursor_at.unwrap_or(0).min(cells.len()));
+
+            // Split it at the new width.
+            let mut row: Vec<Cell> = Vec::with_capacity(cols);
+            let mut k = 0;
+            while k < n {
+                let mut cell = cells[k];
+                let mut width = 1;
+                if cell.attr.has(Attr::WIDE) && cols >= 2 {
+                    width = 2;
+                } else if cell.attr.has(Attr::WIDE | Attr::WIDE_SPACER) {
+                    // An orphaned half, or a wide char in a 1-column grid.
+                    cell.c = ' ';
+                    cell.attr.set(Attr::WIDE | Attr::WIDE_SPACER, false);
+                }
+                if row.len() + width > cols {
+                    if row.len() < cols {
+                        let mut pad = Cell::default();
+                        pad.attr.set(Attr::WIDE_PAD, true);
+                        row.push(pad);
+                    }
+                    out.push(Row {
+                        cells: std::mem::replace(&mut row, Vec::with_capacity(cols)),
+                        wrapped: true,
+                    });
+                }
+                if cursor_at == Some(k) {
+                    cursor = (out.len(), row.len(), false);
+                }
+                row.push(cell);
+                k += 1;
+                if width == 2 {
+                    if cursor_at == Some(k) {
+                        cursor = (out.len(), row.len(), false);
+                    }
+                    let mut spacer = cells
+                        .get(k)
+                        .copied()
+                        .filter(|c| c.attr.has(Attr::WIDE_SPACER));
+                    if spacer.is_some() {
+                        k += 1;
+                    }
+                    row.push(*spacer.get_or_insert_with(|| {
+                        let mut s = Cell { c: ' ', ..cell };
+                        s.attr.set(Attr::WIDE, false);
+                        s.attr.set(Attr::WIDE_SPACER, true);
+                        s
+                    }));
+                }
+            }
+            if cursor_at == Some(n) {
+                // Right after a full row: deferred wrap, as if just typed.
+                cursor = if row.len() < cols {
+                    (out.len(), row.len(), false)
+                } else {
+                    (out.len(), cols - 1, true)
+                };
+            }
+            out.push(Row {
+                cells: row,
+                wrapped: false,
+            });
+        }
+        for row in &mut out {
+            row.cells.resize(cols, Cell::default());
+        }
+        let blank_row = |r: &Row| !r.wrapped && r.cells.iter().all(is_trailing_blank);
+        while out.len() > cursor.0 + 1 && out.last().is_some_and(blank_row) {
+            out.pop();
+        }
+
+        let start = out.len().saturating_sub(rows).min(cursor.0);
+        let mut screen = out.split_off(start);
+        screen.truncate(rows);
+        screen.resize(rows, Row::new(cols, Cell::default()));
+        let excess = out.len().saturating_sub(self.scrollback_limit);
+        self.lines_dropped += excess;
+        self.scrollback = out.into_iter().skip(excess).collect();
+        self.screen = screen;
+        self.cursor_x = cursor.1;
+        self.cursor_y = cursor.0 - start;
+        self.wrap_pending = cursor.2;
     }
 
     // ---- view + selection -----------------------------------------------
@@ -710,14 +976,156 @@ impl Grid {
         }
     }
 
-    pub fn start_selection(&mut self, p: Point) {
-        self.selection = Some(Selection { anchor: p, head: p });
+    /// Make history line `p.line` visible, centering it if it was off-view.
+    pub fn scroll_to_point(&mut self, p: Point) {
+        if self.point_in_viewport(Point { col: 0, ..p }).is_some() {
+            return;
+        }
+        let idx = p.line.saturating_sub(self.lines_dropped);
+        let top = idx.saturating_sub(self.rows / 2).min(self.scrollback.len());
+        self.display_offset = self.scrollback.len() - top;
     }
 
-    pub fn extend_selection(&mut self, p: Point) {
-        if let Some(sel) = &mut self.selection {
-            sel.head = p;
+    /// Where history point `p` is in the viewport as (col, row), if it's
+    /// on screen.
+    pub fn point_in_viewport(&self, p: Point) -> Option<(usize, usize)> {
+        let top = self.lines_dropped + self.scrollback.len() - self.display_offset;
+        let y = p.line.checked_sub(top)?;
+        (y < self.rows && p.col < self.cols).then_some((p.col, y))
+    }
+
+    /// One past the last history line (the first is `lines_dropped`).
+    fn history_end(&self) -> usize {
+        self.lines_dropped + self.scrollback.len() + self.screen.len()
+    }
+
+    /// The first and last line of the logical line (rows joined by
+    /// `wrapped`) holding `line`, which must exist.
+    fn logical_bounds(&self, line: usize) -> (usize, usize) {
+        let (first, end) = (self.lines_dropped, self.history_end());
+        let wraps = |l: usize| self.row_at(l).is_some_and(|r| r.wrapped);
+        let mut start = line;
+        while start > first && wraps(start - 1) {
+            start -= 1;
         }
+        let mut last = line;
+        while last + 1 < end && wraps(last) {
+            last += 1;
+        }
+        (start, last)
+    }
+
+    /// The text of lines `first..=last` as (position, char) pairs, skipping
+    /// wide-char spacers and wrap padding.
+    fn logical_cells(&self, first: usize, last: usize) -> Vec<(Point, char)> {
+        let mut out = Vec::new();
+        for line in first..=last {
+            let Some(row) = self.row_at(line) else {
+                continue;
+            };
+            for (col, cell) in row.cells.iter().enumerate() {
+                let pad = row.wrapped && cell.attr.has(Attr::WIDE_PAD);
+                if !pad && !cell.attr.has(Attr::WIDE_SPACER) {
+                    out.push((Point { line, col }, cell.c));
+                }
+            }
+        }
+        out
+    }
+
+    /// The first and last cell of the `kind` unit at `p`: the cell itself,
+    /// its word (or just it, if it's a separator), or its logical line.
+    fn unit_at(&self, kind: SelectionKind, p: Point) -> (Point, Point) {
+        if kind == SelectionKind::Cell || self.row_at(p.line).is_none() {
+            return (p, p);
+        }
+        let (first, last) = self.logical_bounds(p.line);
+        if kind == SelectionKind::Line {
+            let end_col = self
+                .row_at(last)
+                .map_or(0, |r| r.cells.len().saturating_sub(1));
+            return (
+                Point {
+                    line: first,
+                    col: 0,
+                },
+                Point {
+                    line: last,
+                    col: end_col,
+                },
+            );
+        }
+        let cells = self.logical_cells(first, last);
+        if cells.is_empty() {
+            return (p, p);
+        }
+        let i = cell_index(&cells, p);
+        if !is_word_char(cells[i].1) {
+            return (cells[i].0, cells[i].0);
+        }
+        let mut a = i;
+        while a > 0 && is_word_char(cells[a - 1].1) {
+            a -= 1;
+        }
+        let mut b = i;
+        while b + 1 < cells.len() && is_word_char(cells[b + 1].1) {
+            b += 1;
+        }
+        (cells[a].0, cells[b].0)
+    }
+
+    /// Start a click-drag selection at `p`.
+    pub fn start_selection(&mut self, p: Point) {
+        self.select_unit(SelectionKind::Cell, p);
+    }
+
+    /// Double-click: select the word at `p`.
+    pub fn select_word(&mut self, p: Point) {
+        self.select_unit(SelectionKind::Word, p);
+    }
+
+    /// Triple-click: select the logical line at `p`, wrapped rows included.
+    pub fn select_line(&mut self, p: Point) {
+        self.select_unit(SelectionKind::Line, p);
+    }
+
+    fn select_unit(&mut self, kind: SelectionKind, p: Point) {
+        let (anchor, head) = self.unit_at(kind, p);
+        self.selection = Some(Selection { anchor, head, kind });
+    }
+
+    /// Select all of scrollback and the screen.
+    pub fn select_all(&mut self) {
+        let last = self.history_end() - 1;
+        let col = self
+            .row_at(last)
+            .map_or(0, |r| r.cells.len().saturating_sub(1));
+        self.selection = Some(Selection {
+            anchor: Point {
+                line: self.lines_dropped,
+                col: 0,
+            },
+            head: Point { line: last, col },
+            kind: SelectionKind::Cell,
+        });
+    }
+
+    /// Drag the selection's head to `p`. Word and line selections snap to
+    /// whole units and always keep the unit they started on.
+    pub fn extend_selection(&mut self, p: Point) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        // The anchor always sits inside the starting unit (its first or
+        // last cell), so it can be found again from there.
+        let (us, ue) = self.unit_at(sel.kind, sel.anchor);
+        let (hs, he) = self.unit_at(sel.kind, p);
+        let (anchor, head) = if p < us { (ue, hs) } else { (us, he) };
+        self.selection = Some(Selection {
+            anchor,
+            head,
+            ..sel
+        });
     }
 
     /// Whether viewport cell (col, y) is inside the selection.
@@ -751,6 +1159,7 @@ impl Grid {
                 .take(to.min(row.cells.len()))
                 .skip(from)
                 .filter(|c| !c.attr.has(Attr::WIDE_SPACER))
+                .filter(|c| !(row.wrapped && c.attr.has(Attr::WIDE_PAD)))
                 .map(|c| c.c)
                 .collect();
             let joins_next = row.wrapped && line != end.line;
@@ -763,6 +1172,88 @@ impl Grid {
             }
         }
         Some(out)
+    }
+
+    // ---- search + links -------------------------------------------------
+
+    /// Every occurrence of `needle` in scrollback and screen, oldest first.
+    /// Matches run across wrapped rows but not across real line breaks;
+    /// wide characters count once.
+    pub fn search(&self, needle: &str, case_sensitive: bool) -> Vec<Match> {
+        let fold = |c: char| {
+            if case_sensitive {
+                c
+            } else {
+                c.to_lowercase().next().unwrap_or(c)
+            }
+        };
+        let needle: Vec<char> = needle.chars().map(fold).collect();
+        let mut matches = Vec::new();
+        if needle.is_empty() {
+            return matches;
+        }
+        let end = self.history_end();
+        let mut line = self.lines_dropped;
+        while line < end {
+            let (first, last) = self.logical_bounds(line);
+            let cells = self.logical_cells(first, last);
+            let hay: Vec<char> = cells.iter().map(|&(_, c)| fold(c)).collect();
+            let mut i = 0;
+            while i + needle.len() <= hay.len() {
+                if hay[i..i + needle.len()] == needle[..] {
+                    matches.push(Match {
+                        start: cells[i].0,
+                        end: cells[i + needle.len() - 1].0,
+                    });
+                    i += needle.len();
+                } else {
+                    i += 1;
+                }
+            }
+            line = last + 1;
+        }
+        matches
+    }
+
+    /// The URL under `p` with its first and last cell (inclusive), if any.
+    /// Knows `http(s)://`, `file://`, `ftp://`, `mailto:` and bare `www.`
+    /// (returned with `https://` in front); follows wrapped rows and drops
+    /// trailing punctuation and unbalanced closing brackets or quotes.
+    pub fn url_at(&self, p: Point) -> Option<(String, Point, Point)> {
+        self.row_at(p.line)?;
+        let (first, last) = self.logical_bounds(p.line);
+        let cells = self.logical_cells(first, last);
+        if cells.is_empty() {
+            return None;
+        }
+        let i = cell_index(&cells, p);
+        if !is_url_char(cells[i].1) {
+            return None;
+        }
+        let mut a = i;
+        while a > 0 && is_url_char(cells[a - 1].1) {
+            a -= 1;
+        }
+        let mut b = i + 1;
+        while b < cells.len() && is_url_char(cells[b].1) {
+            b += 1;
+        }
+        let run: Vec<char> = cells[a..b].iter().map(|&(_, c)| c).collect();
+        let at = i - a;
+        // The first URL in the run that covers `p`, like a left-to-right
+        // scan would find it.
+        (0..=at).find_map(|k| {
+            let prefix = url_prefix_at(&run, k)?;
+            let end = k + trim_url_end(&run[k..]);
+            if end <= k + prefix.len() || end <= at {
+                return None;
+            }
+            let mut url: String = run[k..end].iter().collect();
+            if prefix == "www." {
+                url.insert_str(0, "https://");
+            }
+            Some((url, cells[a + k].0, cells[a + end - 1].0))
+        })
     }
 }
 
@@ -917,5 +1408,241 @@ mod tests {
         assert_eq!(row_text(&g, 1), "d");
         assert_eq!(g.scrollback_len(), 2);
         assert_eq!(g.cursor_y, 1);
+    }
+
+    fn lines(g: &mut Grid, lines: &[&str]) {
+        for (i, s) in lines.iter().enumerate() {
+            if i > 0 {
+                g.carriage_return();
+                g.line_feed();
+            }
+            type_str(g, s);
+        }
+    }
+
+    #[test]
+    fn word_selection_runs_over_path_chars() {
+        let mut g = Grid::new(30, 2, 100);
+        type_str(&mut g, "ls ./src/grid.rs (x)  y");
+        g.select_word(g.viewport_point(10, 0));
+        assert_eq!(g.selection_text().unwrap(), "./src/grid.rs");
+        g.select_word(g.viewport_point(17, 0));
+        assert_eq!(g.selection_text().unwrap(), "(", "separator selects itself");
+        g.select_word(g.viewport_point(21, 0));
+        assert_eq!(g.selection_text().unwrap(), "");
+        assert_eq!(g.selection.unwrap().kind, SelectionKind::Word);
+    }
+
+    #[test]
+    fn word_selection_follows_wrapped_rows() {
+        let mut g = Grid::new(4, 3, 100);
+        type_str(&mut g, "ab cdefg h");
+        g.select_word(g.viewport_point(0, 1));
+        assert_eq!(g.selection_text().unwrap(), "cdefg");
+    }
+
+    #[test]
+    fn word_drag_snaps_and_keeps_anchor_word() {
+        let mut g = Grid::new(20, 2, 100);
+        type_str(&mut g, "one two three");
+        g.select_word(g.viewport_point(5, 0));
+        g.extend_selection(g.viewport_point(9, 0));
+        assert_eq!(g.selection_text().unwrap(), "two three");
+        g.extend_selection(g.viewport_point(1, 0));
+        assert_eq!(g.selection_text().unwrap(), "one two");
+    }
+
+    #[test]
+    fn line_selection_takes_whole_logical_line() {
+        let mut g = Grid::new(4, 4, 100);
+        lines(&mut g, &["abcdef", "gh", "ij"]);
+        g.select_line(g.viewport_point(2, 1));
+        assert_eq!(g.selection_text().unwrap(), "abcdef");
+        g.extend_selection(g.viewport_point(0, 2));
+        assert_eq!(g.selection_text().unwrap(), "abcdef\ngh");
+    }
+
+    #[test]
+    fn select_all_covers_scrollback() {
+        let mut g = Grid::new(5, 2, 100);
+        lines(&mut g, &["one", "two", "three"]);
+        g.select_all();
+        assert_eq!(g.selection_text().unwrap(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn search_across_wraps_and_wide_chars() {
+        let mut g = Grid::new(4, 4, 100);
+        lines(&mut g, &["xFOOba", "漢foo"]);
+        let m = g.search("foo", false);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].start, g.viewport_point(1, 0));
+        assert_eq!(m[1].start, g.viewport_point(2, 2), "wide char counts once");
+        assert_eq!(m[1].end, g.viewport_point(0, 3));
+        assert_eq!(
+            g.search("ab漢", true).len(),
+            0,
+            "no match over a real newline"
+        );
+        assert_eq!(g.search("oba", false)[0].end, g.viewport_point(1, 1));
+        assert_eq!(g.search("漢f", true)[0].end, g.viewport_point(2, 2));
+        assert!(g.search("FOO", true).len() == 1 && g.search("", false).is_empty());
+        assert!(is_match_cell(&m, g.viewport_point(2, 0)));
+        assert!(!is_match_cell(&m, g.viewport_point(0, 0)));
+    }
+
+    #[test]
+    fn scroll_to_point_brings_line_into_view() {
+        let mut g = Grid::new(4, 2, 100);
+        for i in 0..10 {
+            lines(&mut g, &[&i.to_string(), ""]);
+        }
+        let p = g.search("2", true)[0].start;
+        assert_eq!(g.point_in_viewport(p), None);
+        g.scroll_to_point(p);
+        let (col, y) = g.point_in_viewport(p).unwrap();
+        assert_eq!(g.visible_row(y).cells[col].c, '2');
+        let offset = g.display_offset;
+        g.scroll_to_point(p);
+        assert_eq!(g.display_offset, offset, "already visible: no move");
+    }
+
+    #[test]
+    fn url_detection() {
+        let mut g = Grid::new(40, 3, 100);
+        lines(
+            &mut g,
+            &[
+                "see (https://x.org/a_(b)), ok",
+                "<www.y.com/p?q=1.>",
+                "mailto:me@z.io",
+            ],
+        );
+        let (url, start, end) = g.url_at(g.viewport_point(10, 0)).unwrap();
+        assert_eq!(url, "https://x.org/a_(b)");
+        assert_eq!((start.col, end.col), (5, 23));
+        assert_eq!(
+            g.url_at(g.viewport_point(5, 1)).unwrap().0,
+            "https://www.y.com/p?q=1"
+        );
+        assert_eq!(
+            g.url_at(g.viewport_point(0, 2)).unwrap().0,
+            "mailto:me@z.io"
+        );
+        assert_eq!(g.url_at(g.viewport_point(1, 0)), None);
+        assert_eq!(
+            g.url_at(g.viewport_point(26, 0)),
+            None,
+            "past the trimmed end"
+        );
+    }
+
+    #[test]
+    fn url_follows_wrapped_rows() {
+        let mut g = Grid::new(8, 3, 100);
+        type_str(&mut g, "'http://a.b/cd' x");
+        let (url, start, end) = g.url_at(g.viewport_point(2, 1)).unwrap();
+        assert_eq!(url, "http://a.b/cd");
+        assert_eq!(start, g.viewport_point(1, 0));
+        assert_eq!(end, g.viewport_point(5, 1));
+    }
+
+    #[test]
+    fn reflow_narrower_then_wider_round_trips() {
+        let mut g = Grid::new(6, 2, 100);
+        type_str(&mut g, "abcdefgh");
+        g.resize(3, 2);
+        assert_eq!(g.scrollback_len(), 1);
+        assert_eq!(
+            (row_text(&g, 0), row_text(&g, 1)),
+            ("def".into(), "gh".into())
+        );
+        assert_eq!((g.cursor_x, g.cursor_y), (2, 1));
+        g.resize(6, 2);
+        assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(
+            (row_text(&g, 0), row_text(&g, 1)),
+            ("abcdef".into(), "gh".into())
+        );
+        assert!(g.visible_row(0).wrapped && !g.visible_row(1).wrapped);
+        assert_eq!((g.cursor_x, g.cursor_y), (2, 1));
+        type_str(&mut g, "i");
+        assert_eq!(row_text(&g, 1), "ghi");
+    }
+
+    #[test]
+    fn reflow_keeps_cursor_after_last_char() {
+        let mut g = Grid::new(4, 3, 100);
+        type_str(&mut g, "abcd");
+        assert!(g.wrap_pending);
+        g.resize(8, 3);
+        assert_eq!((g.cursor_x, g.cursor_y, g.wrap_pending), (4, 0, false));
+        g.resize(4, 3);
+        assert_eq!((g.cursor_x, g.cursor_y, g.wrap_pending), (3, 0, true));
+        type_str(&mut g, "e");
+        assert_eq!(
+            (row_text(&g, 0), row_text(&g, 1)),
+            ("abcd".into(), "e".into())
+        );
+        g.resize(2, 3);
+        assert_eq!(row_text(&g, 2), "e");
+        assert_eq!((g.cursor_x, g.cursor_y), (1, 2));
+    }
+
+    #[test]
+    fn reflow_trailing_blanks_dont_wrap() {
+        let mut g = Grid::new(8, 3, 100);
+        lines(&mut g, &["ab", "cd"]);
+        g.resize(4, 3);
+        assert_eq!(
+            (row_text(&g, 0), row_text(&g, 1)),
+            ("ab".into(), "cd".into())
+        );
+        assert!(!g.visible_row(0).wrapped);
+        assert_eq!((g.cursor_x, g.cursor_y), (2, 1));
+    }
+
+    #[test]
+    fn reflow_never_splits_wide_chars() {
+        let mut g = Grid::new(5, 2, 100);
+        type_str(&mut g, "ab漢c");
+        g.resize(3, 2);
+        assert_eq!(
+            (row_text(&g, 0), row_text(&g, 1)),
+            ("ab".into(), "漢c".into())
+        );
+        assert!(g.cell(2, 0).attr.has(Attr::WIDE_PAD));
+        g.select_all();
+        assert_eq!(g.selection_text().unwrap(), "ab漢c", "pad isn't text");
+        g.resize(5, 2);
+        assert_eq!(row_text(&g, 0), "ab漢c");
+        assert!(g.cell(2, 0).attr.has(Attr::WIDE) && g.cell(3, 0).attr.has(Attr::WIDE_SPACER));
+        assert_eq!((g.cursor_x, g.cursor_y, g.wrap_pending), (4, 0, true));
+    }
+
+    #[test]
+    fn reflow_respects_scrollback_limit() {
+        let mut g = Grid::new(4, 1, 1);
+        type_str(&mut g, "abcdefgh");
+        g.resize(2, 1);
+        assert_eq!(g.scrollback_len(), 1);
+        assert_eq!(row_text(&g, 0), "gh");
+        assert_eq!(
+            g.viewport_point(0, 0).line,
+            3,
+            "dropped lines keep counting"
+        );
+    }
+
+    #[test]
+    fn alt_screen_resize_cuts_instead_of_reflowing() {
+        let mut g = Grid::new(6, 2, 100);
+        g.enter_alt_screen();
+        type_str(&mut g, "abcdef");
+        g.resize(3, 2);
+        assert_eq!(
+            (row_text(&g, 0), row_text(&g, 1)),
+            ("abc".into(), "".into())
+        );
     }
 }
