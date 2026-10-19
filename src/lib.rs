@@ -7,6 +7,7 @@
 
 pub mod boxdraw;
 pub mod config;
+pub mod graphics;
 pub mod grid;
 pub mod input;
 pub mod layout;

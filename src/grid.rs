@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::graphics::Graphics;
+
 /// A color a cell can carry. Resolved to RGB by the renderer from the theme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Color {
@@ -328,6 +330,11 @@ pub struct Grid {
     /// How many lines the view is scrolled back into history. 0 = live.
     pub display_offset: usize,
     pub selection: Option<Selection>,
+    /// Pictures shown in the terminal.
+    pub graphics: Graphics,
+    /// A cell's size in pixels, for sizing pictures (the app keeps it
+    /// current).
+    pub cell_pixels: (u32, u32),
 }
 
 impl Grid {
@@ -352,7 +359,24 @@ impl Grid {
             modes: Modes::default(),
             display_offset: 0,
             selection: None,
+            graphics: Graphics::default(),
+            cell_pixels: (10, 20),
         }
+    }
+
+    /// The history line the cursor is on.
+    pub fn cursor_line(&self) -> usize {
+        self.screen_line(self.cursor_y)
+    }
+
+    /// The history line of live screen row `y`.
+    fn screen_line(&self, y: usize) -> usize {
+        self.lines_dropped + self.scrollback.len() + y
+    }
+
+    /// The history line at the top of the view.
+    pub fn view_top(&self) -> usize {
+        self.lines_dropped + self.scrollback.len() - self.display_offset
     }
 
     pub fn is_alt_screen(&self) -> bool {
@@ -545,6 +569,11 @@ impl Grid {
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(bottom - top + 1);
         let to_history = top == 0 && !self.is_alt_screen();
+        if !to_history {
+            // The rows move but keep their line numbers: carry pictures.
+            let (first, last) = (self.screen_line(top), self.screen_line(bottom));
+            self.shift_images(first, last, -(n as isize));
+        }
         for _ in 0..n {
             let row = self.screen.remove(top);
             let blank = self.blank_row();
@@ -559,6 +588,8 @@ impl Grid {
     pub fn scroll_down(&mut self, n: usize) {
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
         let n = n.min(bottom - top + 1);
+        let (first, last) = (self.screen_line(top), self.screen_line(bottom));
+        self.shift_images(first, last, n as isize);
         for _ in 0..n {
             self.screen.remove(bottom);
             let blank = self.blank_row();
@@ -569,6 +600,7 @@ impl Grid {
     fn push_scrollback(&mut self, row: Row) {
         if self.scrollback_limit == 0 {
             self.lines_dropped += 1;
+            self.drop_old_images();
             return;
         }
         self.scrollback.push_back(row);
@@ -579,6 +611,7 @@ impl Grid {
         if self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
             self.lines_dropped += 1;
+            self.drop_old_images();
             if let Some(sel) = self.selection {
                 if sel.ordered().0.line < self.lines_dropped {
                     self.selection = None;
@@ -588,6 +621,12 @@ impl Grid {
         self.display_offset = self.display_offset.min(self.scrollback.len());
     }
 
+    /// Forget pictures that have left the top of the history.
+    fn drop_old_images(&mut self) {
+        let first = self.lines_dropped;
+        self.graphics.placements.retain(|p| p.line + p.rows > first);
+    }
+
     /// IL — insert blank lines at the cursor, inside the scroll region.
     pub fn insert_lines(&mut self, n: usize) {
         let y = self.cursor_y;
@@ -595,6 +634,8 @@ impl Grid {
             return;
         }
         let n = n.min(self.scroll_bottom - y + 1);
+        let (first, last) = (self.screen_line(y), self.screen_line(self.scroll_bottom));
+        self.shift_images(first, last, n as isize);
         for _ in 0..n {
             self.screen.remove(self.scroll_bottom);
             let blank = self.blank_row();
@@ -611,6 +652,9 @@ impl Grid {
             return;
         }
         let n = n.min(self.scroll_bottom - y + 1);
+        let (first, last) = (self.screen_line(y), self.screen_line(self.scroll_bottom));
+        self.clear_images(first, first + n);
+        self.shift_images(first, last, -(n as isize));
         for _ in 0..n {
             self.screen.remove(y);
             let blank = self.blank_row();
@@ -682,8 +726,12 @@ impl Grid {
                     row.wrapped = false;
                 }
                 self.selection = None;
+                let first = self.screen_line(0);
+                self.clear_images(first, usize::MAX);
             }
             3 => {
+                let first = self.lines_dropped;
+                self.clear_images(first, self.screen_line(0));
                 self.lines_dropped += self.scrollback.len();
                 self.scrollback.clear();
                 self.display_offset = 0;
@@ -729,6 +777,7 @@ impl Grid {
         let blank_screen = vec![Row::new(self.cols, Cell::default()); self.rows];
         let primary = std::mem::replace(&mut self.screen, blank_screen);
         self.parked_primary = Some((primary, cursor));
+        self.graphics.parked = Some(std::mem::take(&mut self.graphics.placements));
         self.display_offset = 0;
         self.selection = None;
         self.wrap_pending = false;
@@ -737,6 +786,7 @@ impl Grid {
     /// ?1049 / ?1047 / ?47 reset: back to the primary screen as it was.
     pub fn exit_alt_screen(&mut self) {
         if let Some((primary, cursor)) = self.parked_primary.take() {
+            self.graphics.placements = self.graphics.parked.take().unwrap_or_default();
             self.screen = primary;
             self.pen = cursor.pen;
             self.move_cursor_to(cursor.x, cursor.y);
@@ -755,6 +805,8 @@ impl Grid {
         for row in &mut self.screen {
             *row = Row::new(self.cols, Cell::default());
         }
+        let first = self.screen_line(0);
+        self.clear_images(first, usize::MAX);
         self.move_cursor_to(0, 0);
         self.selection = None;
     }

@@ -171,6 +171,69 @@ fn renders_tabs_splits_search_and_box_drawing() {
 }
 
 #[test]
+fn renders_pictures_from_kitty_and_sixel() {
+    let config = Config {
+        padding: 0,
+        ..Config::default()
+    };
+    let fonts = Fonts::new(&config, 1.0);
+    let (cw, ch) = (fonts.cell_width, fonts.cell_height);
+    let (w, h) = (20 * cw, 6 * ch);
+    let mut renderer = match Renderer::headless(w, h, fonts, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let mut grid = Grid::new(20, 6, 100);
+    grid.cell_pixels = (cw, ch);
+    let mut vt = Vt::new();
+    // A 2×2 kitty picture (red, green / blue, white) stretched over 4×2
+    // cells, then a sixel block of pure yellow below it.
+    let pixels: [u8; 16] = [
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    ];
+    let b64 = "/wAA/wD/AP8AAP///////w==";
+    assert_eq!(b64.len(), pixels.len().div_ceil(3) * 4);
+    vt.advance(
+        &mut grid,
+        format!("\x1b_Ga=T,f=32,s=2,v=2,c=4,r=2,q=2;{b64}\x1b\\\r\n").as_bytes(),
+    );
+    vt.advance(&mut grid, b"\x1bPq#1;2;100;100;0#1!12~-!12~\x1b\\");
+    // Sixel leaves the cursor on the row below the picture.
+    assert_eq!(grid.cursor_y, 2 + 12usize.div_ceil(ch as usize));
+    let full = Rect::new(0.0, 0.0, w as f32, h as f32);
+    assert!(renderer.render(&Frame::single(&grid, full)));
+    let px = renderer.read_pixels().unwrap();
+    save_snapshot("TACOTERM_SNAPSHOT_IMAGES", &px, w, h);
+    let at = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        (px[i], px[i + 1], px[i + 2])
+    };
+    // Quadrant centres of the stretched picture.
+    let (qw, qh) = (2 * cw, ch);
+    let near = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+        (a.0 as i32 - b.0 as i32).abs() < 40
+            && (a.1 as i32 - b.1 as i32).abs() < 40
+            && (a.2 as i32 - b.2 as i32).abs() < 40
+    };
+    assert!(
+        near(at(qw / 4, qh / 4), (255, 0, 0)),
+        "{:?}",
+        at(qw / 4, qh / 4)
+    );
+    assert!(near(at(qw + qw * 3 / 4, qh / 4), (0, 255, 0)));
+    assert!(near(at(qw / 4, qh + qh * 3 / 4), (0, 0, 255)));
+    // The sixel starts on the row after the picture.
+    assert!(
+        near(at(4, 2 * ch + 3), (255, 255, 0)),
+        "{:?}",
+        at(4, 2 * ch + 3)
+    );
+}
+
+#[test]
 fn renders_settings_page_and_window_buttons() {
     let config = Config {
         padding: 4,

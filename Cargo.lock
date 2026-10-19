@@ -2072,6 +2072,8 @@ dependencies = [
  "arboard",
  "bytemuck",
  "cosmic-text",
+ "image",
+ "miniz_oxide 0.9.1",
  "png 0.17.16",
  "pollster",
  "serde",

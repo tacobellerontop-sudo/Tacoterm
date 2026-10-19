@@ -418,6 +418,10 @@ impl App {
         let (shell, env) = self.config.shell_command();
         // The shell inherits our environment (cmd.exe reads PROMPT there).
         std::env::remove_var("PROMPT");
+        // How programs (tacoshell's img, chafa, …) tell what we can draw.
+        std::env::set_var("TERM_PROGRAM", "tacoterm");
+        std::env::set_var("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        std::env::set_var("COLORTERM", "truecolor");
         for (k, v) in env {
             std::env::set_var(k, v);
         }
@@ -451,10 +455,12 @@ impl App {
             waiter.wait();
             let _ = proxy.send_event(Wake::ChildExited(id));
         });
+        let mut grid = Grid::new(cols as usize, rows as usize, self.config.scrollback_lines);
+        grid.cell_pixels = self.cell_pixels();
         self.panes.insert(
             id,
             Pane {
-                grid: Grid::new(cols as usize, rows as usize, self.config.scrollback_lines),
+                grid,
                 vt: Vt::new(),
                 pty,
                 title: shell_title(&shell),
@@ -596,7 +602,16 @@ impl App {
     }
 
     /// Fit every pane's grid (and ConPTY) to its rect.
+    /// A cell's size in pixels, which pictures are measured against.
+    fn cell_pixels(&self) -> (u32, u32) {
+        self.renderer.as_ref().map_or((10, 20), |r| r.cell_size())
+    }
+
     fn fit_all(&mut self) {
+        let cell = self.cell_pixels();
+        for p in self.panes.values_mut() {
+            p.grid.cell_pixels = cell;
+        }
         let Some(r) = &self.renderer else { return };
         let area = self.content_area();
         let gap = r.divider_width() as f32;

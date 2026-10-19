@@ -3,6 +3,11 @@
 //! Spawns the shell attached to a pseudo-console and hands back two pipes:
 //! write keystrokes to `input`, read terminal bytes from `output`.
 //!
+//! ConPTY comes from `conpty.dll` + `OpenConsole.exe` beside tacoterm.exe
+//! when they are there (Windows Terminal's newer console, which passes
+//! pictures and other sequences it doesn't know straight through), else
+//! from Windows itself.
+//!
 //! The read side blocks, so the app drains it on a dedicated thread and
 //! forwards chunks to the UI thread over a channel. Everything else —
 //! writing input, resizing — happens on the UI thread.
@@ -12,12 +17,14 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
+use std::sync::OnceLock;
 
-use windows::core::{HSTRING, PCWSTR, PWSTR};
+use windows::core::{s, HRESULT, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
@@ -26,6 +33,62 @@ use windows::Win32::System::Threading::{
     PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     STARTUPINFOW,
 };
+
+type Create = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
+type Resize = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
+type Close = unsafe extern "system" fn(HPCON);
+type Proc = unsafe extern "system" fn() -> isize;
+
+/// The bundled console's entry points.
+struct Bundled {
+    create: Create,
+    resize: Resize,
+    close: Close,
+}
+
+/// The bundled console, if it ships next to tacoterm.exe.
+fn bundled() -> Option<&'static Bundled> {
+    static BUNDLED: OnceLock<Option<Bundled>> = OnceLock::new();
+    BUNDLED
+        .get_or_init(|| {
+            let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            // conpty.dll starts OpenConsole.exe from its own folder.
+            if !dir.join("OpenConsole.exe").is_file() {
+                return None;
+            }
+            let dll = dir.join("conpty.dll");
+            if !dll.is_file() {
+                return None;
+            }
+            unsafe {
+                let lib = LoadLibraryW(&HSTRING::from(dll.as_os_str())).ok()?;
+                let create = GetProcAddress(lib, s!("ConptyCreatePseudoConsole"))?;
+                let resize = GetProcAddress(lib, s!("ConptyResizePseudoConsole"))?;
+                let close = GetProcAddress(lib, s!("ConptyClosePseudoConsole"))?;
+                Some(Bundled {
+                    create: std::mem::transmute::<Proc, Create>(create),
+                    resize: std::mem::transmute::<Proc, Resize>(resize),
+                    close: std::mem::transmute::<Proc, Close>(close),
+                })
+            }
+        })
+        .as_ref()
+}
+
+unsafe fn create_console(
+    size: COORD,
+    input: HANDLE,
+    output: HANDLE,
+) -> windows::core::Result<HPCON> {
+    match bundled() {
+        Some(b) => {
+            let mut hpc = HPCON::default();
+            (b.create)(size, input, output, 0, &mut hpc).ok()?;
+            Ok(hpc)
+        }
+        None => CreatePseudoConsole(size, input, output, 0),
+    }
+}
 
 pub struct Pty {
     hpc: HPCON,
@@ -57,7 +120,7 @@ impl Pty {
                 X: cols as i16,
                 Y: rows as i16,
             };
-            let created = CreatePseudoConsole(size, pty_in_read, pty_out_write, 0);
+            let created = create_console(size, pty_in_read, pty_out_write);
             // The console holds its own references to its ends; close ours.
             let _ = CloseHandle(pty_in_read);
             let _ = CloseHandle(pty_out_write);
@@ -152,14 +215,15 @@ impl Pty {
 
     /// Tell the console the window changed size.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        let size = COORD {
+            X: cols as i16,
+            Y: rows as i16,
+        };
         unsafe {
-            ResizePseudoConsole(
-                self.hpc,
-                COORD {
-                    X: cols as i16,
-                    Y: rows as i16,
-                },
-            )
+            match bundled() {
+                Some(b) => (b.resize)(self.hpc, size).ok(),
+                None => ResizePseudoConsole(self.hpc, size),
+            }
             .map_err(io::Error::from)
         }
     }
@@ -207,7 +271,10 @@ impl ExitWaiter {
 impl Drop for Pty {
     fn drop(&mut self) {
         unsafe {
-            ClosePseudoConsole(self.hpc);
+            match bundled() {
+                Some(b) => (b.close)(self.hpc),
+                None => ClosePseudoConsole(self.hpc),
+            }
             if !self.child.is_invalid() {
                 let _ = CloseHandle(self.child);
             }
