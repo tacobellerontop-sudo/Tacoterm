@@ -60,6 +60,26 @@ Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on t
 - Built-in color schemes and a colored prompt; `config.toml` applies live
 - Per-monitor DPI scaling
 
+## Install
+
+Download `tacoterm-<version>-setup.exe` (the **tacoterm-setup** artifact of
+the latest Windows CI run) and run it. It installs for just you, no admin
+needed (or for everyone, if you pick that), with:
+
+- a Start menu entry and, if you like, a desktop shortcut
+- **Open in tacoterm** on folder and drive right-click menus
+- tacoterm on your PATH, so `tacoterm` starts it from any console
+- the console that passes pictures through, and tacoshell when it's built
+  alongside (with an option to make it the default shell)
+
+Uninstall from Settings → Apps. Your `config.toml` stays.
+
+To build the installer yourself, after the build below:
+`.\scripts\build-installer.ps1` (it fetches Inno Setup if needed) writes
+`target\installer\tacoterm-<version>-setup.exe`.
+
+`tacoterm --cwd DIR` (or `tacoterm DIR`) opens in that folder.
+
 ## Build (Windows)
 
 ```

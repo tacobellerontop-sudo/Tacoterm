@@ -375,7 +375,26 @@ pub fn available_shells() -> Vec<ShellChoice> {
             setting: "wsl.exe ~",
         });
     }
+    if let Some(setting) = tacoshell_setting() {
+        out.push(ShellChoice {
+            label: "tacoshell",
+            setting,
+        });
+    }
     out
+}
+
+/// The `shell =` setting for tacoshell when the installer put it beside
+/// tacoterm.exe.
+fn tacoshell_setting() -> Option<&'static str> {
+    static SETTING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SETTING
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let shell = exe.with_file_name("tacoshell.exe");
+            shell.is_file().then(|| quote(&shell))
+        })
+        .as_deref()
 }
 
 /// Encode a PowerShell script for `-EncodedCommand` (base64 of UTF-16LE),
