@@ -27,9 +27,13 @@ settings page (or set `shell = "tacoshell.exe"` in `config.toml`).
   `pwd`, `echo`, `set`, `export`, `unset`, `env`, `alias`, `unalias`,
   `which`, `history`, `clear`/`cls`, `source`, `help`, `exit`
 - The everyday Unix commands, built in so they're on every machine: `cat`,
-  `head`, `tail`, `wc`, `grep` (regex), `sort`, `uniq`, `tee`, `mkdir`,
-  `touch`, `cp`, `mv`, `rm`, `basename`, `dirname`, `realpath`, `sleep`,
+  `head`, `tail`, `wc`, `grep` (regex), `sort`, `uniq`, `cut`, `tr`, `seq`,
+  `tee`, `find`, `mkdir`, `touch`, `cp`, `mv`, `rm`, `du`, `df`, `ps`,
+  `kill`, `date`, `time`, `basename`, `dirname`, `realpath`, `sleep`,
   `open`. They read files, or a pipe or `< file` when given none
+- In the terminal, `cat`, `head`, `tail` and `grep` draw their text in a
+  box so it stands apart from what you typed; piped or redirected, the text
+  stays plain
 - Pictures: `img photo.png` shows one with the kitty graphics protocol
   (`-k`), sixel (`-s`) or colored half-blocks that work in any terminal
   (`-b`). It picks kitty where the terminal is known to show it;

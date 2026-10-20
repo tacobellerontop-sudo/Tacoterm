@@ -7,9 +7,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const NAMES: &[&str] = &[
-    "basename", "cat", "cp", "dirname", "grep", "head", "img", "mkdir", "mv", "open", "realpath",
-    "rm", "sleep", "sort", "tail", "tee", "touch", "uniq", "wc",
+    "basename", "cat", "cp", "cut", "date", "df", "dirname", "du", "find", "grep", "head", "img",
+    "kill", "mkdir", "mv", "open", "ps", "realpath", "rm", "seq", "sleep", "sort", "tail", "tee",
+    "touch", "tr", "uniq", "wc",
 ];
+
+/// Commands whose output is text to read; in a terminal it goes in a box,
+/// so it stands apart from what you typed.
+const BOXED: &[&str] = &["cat", "grep", "head", "tail"];
 
 /// Where a command's input comes from.
 pub enum Source {
@@ -108,17 +113,62 @@ impl Args {
     }
 }
 
-/// Run built-in `name`; `None` if it isn't one of these.
+/// Run built-in `name`; `None` if it isn't one of these. `to_terminal`
+/// says the output goes straight to the screen (rather than a pipe or file),
+/// where text output is drawn in a box.
 pub fn run(
+    name: &str,
+    args: &[String],
+    input: &mut Input,
+    to_terminal: bool,
+    out: &mut Vec<u8>,
+    err: &mut Vec<u8>,
+) -> Option<i32> {
+    let status = run_command(name, args, input, out, err)?;
+    if to_terminal && BOXED.contains(&name) && !out.is_empty() {
+        let title = match name {
+            "grep" => format!(
+                "grep {}",
+                args.iter()
+                    .find(|a| !a.starts_with('-'))
+                    .map_or("", |a| a.as_str())
+            ),
+            _ => {
+                let files: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.starts_with('-') && a.parse::<usize>().is_err())
+                    .map(String::as_str)
+                    .collect();
+                if files.is_empty() {
+                    name.to_string()
+                } else {
+                    files.join(", ")
+                }
+            }
+        };
+        let text = String::from_utf8_lossy(out).into_owned();
+        *out = boxed(&title, &text, crate::term::columns()).into_bytes();
+    }
+    Some(status)
+}
+
+fn run_command(
     name: &str,
     args: &[String],
     input: &mut Input,
     out: &mut Vec<u8>,
     err: &mut Vec<u8>,
 ) -> Option<i32> {
+    // These read their arguments themselves (`find -name`, `seq -5 5`).
+    match name {
+        "find" => return Some(find(args, out, err)),
+        "seq" => return Some(seq(args, out, err)),
+        _ => {}
+    }
     let with_value: &[char] = match name {
         "head" | "tail" => &['n'],
         "img" => &['w'],
+        "cut" => &['d', 'f', 'c'],
         _ => &[],
     };
     let args = match Args::parse(args, with_value) {
@@ -306,6 +356,166 @@ pub fn run(
                 err,
             ));
         }
+        "date" => date(args.operands.first().map(String::as_str), out),
+        "du" => {
+            let mut rows = Vec::new();
+            let mut total = 0;
+            let targets: Vec<PathBuf> = if args.operands.is_empty() {
+                match fs::read_dir(".") {
+                    Ok(entries) => {
+                        let mut v: Vec<PathBuf> = entries
+                            .flatten()
+                            .map(|e| PathBuf::from(e.file_name()))
+                            .collect();
+                        v.sort_by_key(|p| p.display().to_string().to_lowercase());
+                        v
+                    }
+                    Err(e) => return Some(fail(name, e.to_string(), err)),
+                }
+            } else {
+                args.operands.iter().map(PathBuf::from).collect()
+            };
+            for path in targets {
+                let size = match path.symlink_metadata() {
+                    Ok(m) if m.is_dir() => folder_size(&path),
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        let _ = writeln!(err, "{}: {e}", path.display());
+                        continue;
+                    }
+                };
+                total += size;
+                rows.push([human_size(size), path.display().to_string()]);
+            }
+            if rows.len() > 1 {
+                rows.push([human_size(total), "(total)".to_string()]);
+            }
+            let _ = out.write_all(table(["SIZE", "NAME"], &rows, &[0]).as_bytes());
+            Ok(())
+        }
+        "df" => {
+            let rows: Vec<[String; 5]> = disks()
+                .into_iter()
+                .map(|(name, total, free)| {
+                    let used = total.saturating_sub(free);
+                    let pct = (used * 100).checked_div(total).unwrap_or(0);
+                    [
+                        name,
+                        human_size(total),
+                        human_size(used),
+                        human_size(free),
+                        format!("{pct}%"),
+                    ]
+                })
+                .collect();
+            let _ = out.write_all(
+                table(
+                    ["DRIVE", "SIZE", "USED", "FREE", "USE%"],
+                    &rows,
+                    &[1, 2, 3, 4],
+                )
+                .as_bytes(),
+            );
+            Ok(())
+        }
+        "ps" => {
+            let program = if cfg!(windows) { "tasklist" } else { "ps" };
+            let mut c = std::process::Command::new(program);
+            if !cfg!(windows) {
+                c.args(&args.operands);
+                if args.operands.is_empty() {
+                    c.arg("-e");
+                }
+            }
+            match c.output() {
+                Ok(o) => {
+                    out.extend_from_slice(&o.stdout);
+                    err.extend_from_slice(&o.stderr);
+                    Ok(())
+                }
+                Err(e) => Err(format!("{program}: {e}")),
+            }
+        }
+        "kill" => {
+            let force = args.has('9') || args.has('f');
+            each_operand(&args.operands, err, |pid| kill(pid, force))
+        }
+        "cut" => {
+            let delim = args
+                .value('d')
+                .map(|d| d.chars().next().unwrap_or('\t'))
+                .unwrap_or('\t');
+            let (list, by_char) = match (args.value('f'), args.value('c')) {
+                (Some(f), _) => (f, false),
+                (None, Some(c)) => (c, true),
+                _ => {
+                    return Some(fail(
+                        name,
+                        "cut -f LIST [-d DELIM]  or  cut -c LIST".into(),
+                        err,
+                    ))
+                }
+            };
+            match parse_list(list) {
+                Err(e) => Err(e),
+                Ok(ranges) => each_input(&args.operands, input, err, |_, data| {
+                    let text = String::from_utf8_lossy(&data);
+                    let wanted =
+                        |i: usize| ranges.iter().any(|(a, b)| (*a..=*b).contains(&(i + 1)));
+                    for line in text.lines() {
+                        let picked: String = if by_char {
+                            line.chars()
+                                .enumerate()
+                                .filter(|(i, _)| wanted(*i))
+                                .map(|(_, c)| c)
+                                .collect()
+                        } else {
+                            let fields: Vec<&str> = line
+                                .split(delim)
+                                .enumerate()
+                                .filter(|(i, _)| wanted(*i))
+                                .map(|(_, f)| f)
+                                .collect();
+                            fields.join(&delim.to_string())
+                        };
+                        let _ = writeln!(out, "{picked}");
+                    }
+                    Ok(())
+                }),
+            }
+        }
+        "tr" => {
+            let from = args
+                .operands
+                .first()
+                .map(|s| expand_set(s))
+                .unwrap_or_default();
+            let to = args
+                .operands
+                .get(1)
+                .map(|s| expand_set(s))
+                .unwrap_or_default();
+            if from.is_empty() || (!args.has('d') && to.is_empty()) {
+                return Some(fail(
+                    name,
+                    "tr SET1 SET2  or  tr -d SET1  (sets like a-z)".into(),
+                    err,
+                ));
+            }
+            input.read_all().map_err(|e| e.to_string()).map(|data| {
+                let text = String::from_utf8_lossy(&data);
+                let mapped: String = text
+                    .chars()
+                    .filter_map(|c| match from.iter().position(|&f| f == c) {
+                        None => Some(c),
+                        Some(_) if args.has('d') => None,
+                        // A shorter SET2 repeats its last character.
+                        Some(i) => Some(*to.get(i).unwrap_or(to.last().unwrap())),
+                    })
+                    .collect();
+                out.extend_from_slice(mapped.as_bytes());
+            })
+        }
         _ => return None,
     };
     Some(match result {
@@ -316,6 +526,377 @@ pub fn run(
             1
         }
     })
+}
+
+fn fail(name: &str, message: String, err: &mut Vec<u8>) -> i32 {
+    let _ = writeln!(err, "{name}: {message}");
+    2
+}
+
+/// Draw text in a rounded box, wrapped to fit `cols`, with a title on top.
+pub fn boxed(title: &str, text: &str, cols: usize) -> String {
+    use crate::editor::str_width;
+    let max = cols.saturating_sub(4).max(10);
+    let mut lines: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let clean: String = raw
+            .replace('\t', "    ")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let mut line = String::new();
+        for c in clean.chars() {
+            if str_width(&line) + str_width(&c.to_string()) > max {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(c);
+        }
+        lines.push(line);
+    }
+    let mut title: String = title.chars().filter(|c| !c.is_control()).collect();
+    while str_width(&title) + 2 > max {
+        title.pop();
+    }
+    let label = format!(" {title} ");
+    let width = lines
+        .iter()
+        .map(|l| str_width(l))
+        .max()
+        .unwrap_or(0)
+        .max(str_width(&label))
+        .min(max);
+    let (dim, reset) = ("\x1b[2m", "\x1b[0m");
+    let mut s = format!(
+        "{dim}\u{256d}\u{2500}{reset}{label}{dim}{}\u{256e}{reset}\n",
+        "\u{2500}".repeat(width + 1 - str_width(&label))
+    );
+    for line in &lines {
+        let pad = " ".repeat(width - str_width(line));
+        s.push_str(&format!(
+            "{dim}\u{2502}{reset} {line}{pad} {dim}\u{2502}{reset}\n"
+        ));
+    }
+    s.push_str(&format!(
+        "{dim}\u{2570}{}\u{256f}{reset}\n",
+        "\u{2500}".repeat(width + 2)
+    ));
+    s
+}
+
+/// Everything under a folder, added up. Links aren't followed, and what
+/// can't be read counts as nothing.
+pub fn folder_size(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_symlink() => 0,
+            Ok(t) if t.is_dir() => folder_size(&e.path()),
+            _ => e.metadata().map_or(0, |m| m.len()),
+        })
+        .sum()
+}
+
+/// `512 B`, `1.50 KB`, `2.12 TB` (1 KB = 1024 bytes, like Explorer).
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+/// Columns padded to line up and split by ` | `; the columns in `right`
+/// are right-aligned (numbers and sizes).
+pub fn table<const N: usize>(header: [&str; N], rows: &[[String; N]], right: &[usize]) -> String {
+    use crate::editor::str_width;
+    let mut widths = header.map(str_width);
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(str_width(cell));
+        }
+    }
+    let line = |cells: [&str; N]| {
+        let shown: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let pad = " ".repeat(widths[i] - str_width(cell));
+                if right.contains(&i) {
+                    format!("{pad}{cell}")
+                } else if i + 1 == N {
+                    cell.to_string()
+                } else {
+                    format!("{cell}{pad}")
+                }
+            })
+            .collect();
+        shown.join(" | ") + "\n"
+    };
+    let mut s = line(header);
+    for row in rows {
+        s.push_str(&line(std::array::from_fn(|i| row[i].as_str())));
+    }
+    s
+}
+
+/// `date` or `date +FORMAT` (strftime: `+%Y-%m-%d %H:%M`).
+fn date(format: Option<&str>, out: &mut Vec<u8>) -> Result<(), String> {
+    use chrono::format::{Item, StrftimeItems};
+    let format = match format {
+        Some(f) => f
+            .strip_prefix('+')
+            .ok_or("date [+FORMAT], like date +%Y-%m-%d")?,
+        None => "%a %d %b %Y %H:%M:%S %:z",
+    };
+    if StrftimeItems::new(format).any(|i| matches!(i, Item::Error)) {
+        return Err(format!("bad format: {format}"));
+    }
+    let _ = writeln!(out, "{}", chrono::Local::now().format(format));
+    Ok(())
+}
+
+/// `*` and `?` wildcards.
+fn wildcard(pattern: &[char], name: &[char]) -> bool {
+    match (pattern.first(), name.first()) {
+        (None, None) => true,
+        (Some('*'), _) => {
+            wildcard(&pattern[1..], name) || (!name.is_empty() && wildcard(pattern, &name[1..]))
+        }
+        (Some('?'), Some(_)) => wildcard(&pattern[1..], &name[1..]),
+        (Some(p), Some(n)) if p == n => wildcard(&pattern[1..], &name[1..]),
+        _ => false,
+    }
+}
+
+/// `find [PATH...] [-name GLOB] [-iname GLOB] [-type f|d] [-maxdepth N]`
+fn find(args: &[String], out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
+    let mut roots = Vec::new();
+    let mut name: Option<(Vec<char>, bool)> = None;
+    let mut kind: Option<char> = None;
+    let mut max_depth = usize::MAX;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut value = || it.next().cloned().ok_or(format!("{arg} needs a value"));
+        let parsed = match arg.as_str() {
+            "-name" | "-iname" => value().map(|v| {
+                let ci = arg == "-iname" || cfg!(windows);
+                let v = if ci { v.to_lowercase() } else { v };
+                name = Some((v.chars().collect(), ci));
+            }),
+            "-type" => value().and_then(|v| match v.as_str() {
+                "f" | "d" => {
+                    kind = v.chars().next();
+                    Ok(())
+                }
+                _ => Err("-type takes f (files) or d (folders)".to_string()),
+            }),
+            "-maxdepth" => value().and_then(|v| {
+                v.parse()
+                    .map(|n| max_depth = n)
+                    .map_err(|_| format!("not a number: {v}"))
+            }),
+            a if a.starts_with('-') => Err(format!("unknown option {a}")),
+            a => {
+                roots.push(PathBuf::from(a));
+                Ok(())
+            }
+        };
+        if let Err(e) = parsed {
+            return fail("find", e, err);
+        }
+    }
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+    fn walk(
+        path: &Path,
+        depth: usize,
+        max: usize,
+        visit: &mut dyn FnMut(&Path, bool),
+        err: &mut Vec<u8>,
+    ) {
+        let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
+        visit(path, is_dir);
+        if !is_dir || depth >= max {
+            return;
+        }
+        match fs::read_dir(path) {
+            Ok(entries) => {
+                let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                entries.sort();
+                for e in entries {
+                    walk(&e, depth + 1, max, visit, err);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "find: {}: {e}", path.display());
+            }
+        }
+    }
+    let mut visit = |path: &Path, is_dir: bool| {
+        if kind == Some('f') && is_dir || kind == Some('d') && !is_dir {
+            return;
+        }
+        if let Some((pattern, ci)) = &name {
+            let file = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let file = if *ci { file.to_lowercase() } else { file };
+            if !wildcard(pattern, &file.chars().collect::<Vec<_>>()) {
+                return;
+            }
+        }
+        let _ = writeln!(out, "{}", path.display());
+    };
+    for root in &roots {
+        if root.symlink_metadata().is_err() {
+            let _ = writeln!(err, "find: {}: not found", root.display());
+            continue;
+        }
+        walk(root, 0, max_depth, &mut visit, err);
+    }
+    if err.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// `seq LAST`, `seq FIRST LAST`, `seq FIRST STEP LAST`
+fn seq(args: &[String], out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
+    let nums: Result<Vec<i64>, _> = args.iter().map(|a| a.parse::<i64>()).collect();
+    let (first, step, last) = match nums.as_deref() {
+        Ok([last]) => (1, 1, *last),
+        Ok([first, last]) => (*first, 1, *last),
+        Ok([first, step, last]) if *step != 0 => (*first, *step, *last),
+        _ => return fail("seq", "seq [FIRST [STEP]] LAST, whole numbers".into(), err),
+    };
+    let mut n = first;
+    while (step > 0 && n <= last) || (step < 0 && n >= last) {
+        let _ = writeln!(out, "{n}");
+        n += step;
+    }
+    0
+}
+
+/// `1,3,5-7` → ranges (1-based, inclusive). `-3` and `5-` work too.
+fn parse_list(list: &str) -> Result<Vec<(usize, usize)>, String> {
+    list.split(',')
+        .map(|part| {
+            let num = |s: &str, default: usize| {
+                if s.is_empty() {
+                    Ok(default)
+                } else {
+                    s.parse::<usize>().map_err(|_| format!("bad list: {list}"))
+                }
+            };
+            match part.split_once('-') {
+                Some((a, b)) => Ok((num(a, 1)?, num(b, usize::MAX)?)),
+                None => {
+                    let n = num(part, 0)?;
+                    Ok((n, n))
+                }
+            }
+        })
+        .collect()
+}
+
+/// `a-z0-9_` → every character in it.
+fn expand_set(set: &str) -> Vec<char> {
+    let chars: Vec<char> = set.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '-' && chars[i] <= chars[i + 2] {
+            out.extend(chars[i]..=chars[i + 2]);
+            i += 3;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn kill(pid: &str, force: bool) -> std::io::Result<()> {
+    let pid: u32 = pid
+        .parse()
+        .map_err(|_| std::io::Error::other("not a process id"))?;
+    #[cfg(windows)]
+    {
+        let mut c = std::process::Command::new("taskkill");
+        c.args(["/PID", &pid.to_string()]);
+        if force {
+            c.arg("/F");
+        }
+        let o = c.output()?;
+        if o.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            ))
+        }
+    }
+    #[cfg(unix)]
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+/// Every drive (Windows) or the root file system: name, size, free bytes.
+fn disks() -> Vec<(String, u64, u64)> {
+    #[cfg(windows)]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives};
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26u8)
+            .filter(|i| mask & (1 << i) != 0)
+            .filter_map(|i| {
+                let root = format!("{}:\\", (b'A' + i) as char);
+                let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+                unsafe {
+                    GetDiskFreeSpaceExW(
+                        &HSTRING::from(root.as_str()),
+                        Some(&mut avail),
+                        Some(&mut total),
+                        Some(&mut free),
+                    )
+                }
+                .ok()?;
+                Some((root, total, avail))
+            })
+            .collect()
+    }
+    #[cfg(unix)]
+    {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c"/".as_ptr(), &mut st) } != 0 {
+            return Vec::new();
+        }
+        let block = st.f_frsize as u64;
+        vec![(
+            "/".to_string(),
+            st.f_blocks as u64 * block,
+            st.f_bavail as u64 * block,
+        )]
+    }
 }
 
 fn write_counts(out: &mut Vec<u8>, counts: &[usize; 3], all: bool, args: &Args, label: &str) {
@@ -542,7 +1123,7 @@ mod tests {
         drop(writer);
         let mut input = Input(Some(Source::Pipe(reader)));
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(name, &args, &mut input, &mut out, &mut err).unwrap();
+        let code = run(name, &args, &mut input, false, &mut out, &mut err).unwrap();
         (
             code,
             String::from_utf8(out).unwrap(),
@@ -569,6 +1150,47 @@ mod tests {
     }
 
     #[test]
+    fn more_text_commands() {
+        assert_eq!(run_with("seq", &["3"], "").1, "1\n2\n3\n");
+        assert_eq!(run_with("seq", &["5", "-2", "1"], "").1, "5\n3\n1\n");
+        assert_eq!(
+            run_with("cut", &["-d", ",", "-f", "1,3"], "a,b,c\nd,e,f\n").1,
+            "a,c\nd,f\n"
+        );
+        assert_eq!(run_with("cut", &["-c", "2-3"], "hello\n").1, "el\n");
+        assert_eq!(run_with("tr", &["a-z", "A-Z"], "taco\n").1, "TACO\n");
+        assert_eq!(
+            run_with("tr", &["-d", "aeiou"], "taco shell\n").1,
+            "tc shll\n"
+        );
+        assert_eq!(run_with("date", &["+%Y"], "").1.trim().len(), 4);
+        assert_eq!(run_with("date", &["+%Q"], "").0, 1);
+        assert!(wildcard(
+            &['*', '.', 'r', 's'],
+            &"main.rs".chars().collect::<Vec<_>>()
+        ));
+        assert!(!wildcard(&['?', 'x'], &"abx".chars().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn boxes_and_tables() {
+        let b = boxed("notes.txt", "hi\nthere", 80);
+        let plain: String = b.replace("\x1b[2m", "").replace("\x1b[0m", "");
+        assert_eq!(
+            plain,
+            "\u{256d}\u{2500} notes.txt \u{2500}\u{256e}\n\
+             \u{2502} hi          \u{2502}\n\
+             \u{2502} there       \u{2502}\n\
+             \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n"
+        );
+        // Long lines wrap inside the box.
+        let b = boxed("t", &"x".repeat(30), 14);
+        assert_eq!(b.replace("\x1b[0m", "").matches("\u{2502} ").count(), 3);
+        let t = table(["A", "BB"], &[["xyz".into(), "1".into()]], &[1]);
+        assert_eq!(t, "A   | BB\nxyz |  1\n");
+    }
+
+    #[test]
     fn grep_flags() {
         let text = "Apple pie\nbanana\napple tart\n";
         assert_eq!(
@@ -582,6 +1204,28 @@ mod tests {
         assert_eq!(run_with("grep", &["-c", "an"], text).1, "1\n");
         assert_eq!(run_with("grep", &["-F", "."], text).0, 1);
         assert_eq!(run_with("grep", &["("], text).0, 2);
+    }
+
+    #[test]
+    fn find_and_du() {
+        let dir = std::env::temp_dir().join(format!("tacoshell-find-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src/deep")).unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(dir.join("src/deep/lib.rs"), "").unwrap();
+        fs::write(dir.join("README.md"), "").unwrap();
+        let d = dir.display().to_string();
+        let found = run_with("find", &[&d, "-name", "*.rs"], "").1;
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            found,
+            format!("{d}{sep}src{sep}deep{sep}lib.rs\n{d}{sep}src{sep}main.rs\n")
+        );
+        let folders = run_with("find", &[&d, "-type", "d", "-maxdepth", "1"], "").1;
+        assert_eq!(folders, format!("{d}\n{d}{sep}src\n"));
+        let du = run_with("du", &[&dir.join("src").display().to_string()], "").1;
+        assert!(du.starts_with("SIZE | NAME\n12 B | "), "{du}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

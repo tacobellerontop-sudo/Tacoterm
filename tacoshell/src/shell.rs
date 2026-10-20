@@ -12,7 +12,8 @@ use std::process::{Child, Stdio};
 
 pub const BUILTINS: &[&str] = &[
     "alias", "cd", "clear", "cls", "dirs", "echo", "env", "exit", "export", "false", "help",
-    "history", "ls", "popd", "pushd", "pwd", "set", "source", "true", "unalias", "unset", "which",
+    "history", "ls", "popd", "pushd", "pwd", "set", "source", "time", "true", "unalias", "unset",
+    "which",
 ];
 
 /// The shell's own commands and the everyday ones in `commands`.
@@ -33,6 +34,9 @@ pub struct Shell {
     prev_dir: Option<PathBuf>,
     /// `pushd` / `popd`
     dir_stack: Vec<PathBuf>,
+    /// Whether the running built-in's output goes straight to the terminal
+    /// (then text gets a box around it).
+    to_terminal: bool,
 }
 
 /// A command with its words expanded.
@@ -139,6 +143,7 @@ impl Shell {
             history_file: None,
             prev_dir: None,
             dir_stack: Vec::new(),
+            to_terminal: false,
         }
     }
 
@@ -484,6 +489,8 @@ impl Shell {
         } else if builtin == "cd.." {
             self.cd(&["..".to_string()], &mut out, &mut err)
         } else {
+            self.to_terminal = matches!(stdout, Sink::Inherit)
+                && std::io::IsTerminal::is_terminal(&std::io::stdout());
             self.builtin(
                 builtin,
                 &args[1..],
@@ -723,7 +730,24 @@ impl Shell {
                 let _ = writeln!(out, "{}", all.join(" "));
                 0
             }
-            _ => match commands::run(name, args, input, out, err) {
+            "time" => {
+                // Run the rest as a command line and say how long it took.
+                let line: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        if a.is_empty() || a.contains([' ', '\'', '"', '|', '&', ';', '<', '>']) {
+                            format!("'{}'", a.replace('\'', "'`''"))
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect();
+                let start = std::time::Instant::now();
+                let status = self.run_line(&line.join(" "));
+                let _ = writeln!(err, "real {:.3}s", start.elapsed().as_secs_f64());
+                status
+            }
+            _ => match commands::run(name, args, input, self.to_terminal, out, err) {
                 Some(status) => status,
                 None => unreachable!("{name} is a built-in"),
             },
@@ -850,77 +874,19 @@ fn ls(args: &[String], out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
             .map(|e| {
                 let (kind, size) = match e.file_type() {
                     Ok(t) if t.is_symlink() => ("LINK", 0),
-                    Ok(t) if t.is_dir() => ("FOLDER", folder_size(&e.path())),
+                    Ok(t) if t.is_dir() => ("FOLDER", commands::folder_size(&e.path())),
                     _ => ("FILE", e.metadata().map_or(0, |m| m.len())),
                 };
                 [
                     kind.to_string(),
                     e.file_name().to_string_lossy().into_owned(),
-                    human_size(size),
+                    commands::human_size(size),
                 ]
             })
             .collect();
-        let _ = out.write_all(table(["TYPE", "NAME", "SIZE"], &rows).as_bytes());
+        let _ = out.write_all(commands::table(["TYPE", "NAME", "SIZE"], &rows, &[2]).as_bytes());
     }
     status
-}
-
-/// Everything under a folder, added up. Links aren't followed, and what
-/// can't be read counts as nothing.
-fn folder_size(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.file_type() {
-            Ok(t) if t.is_symlink() => 0,
-            Ok(t) if t.is_dir() => folder_size(&e.path()),
-            _ => e.metadata().map_or(0, |m| m.len()),
-        })
-        .sum()
-}
-
-/// `512 B`, `1.50 KB`, `2.12 TB` (1 KB = 1024 bytes, like Explorer).
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.2} {}", UNITS[unit])
-}
-
-/// Columns padded to line up, split by ` | `; sizes are right-aligned.
-fn table(header: [&str; 3], rows: &[[String; 3]]) -> String {
-    let mut widths = header.map(crate::editor::str_width);
-    for row in rows {
-        for (w, cell) in widths.iter_mut().zip(row) {
-            *w = (*w).max(crate::editor::str_width(cell));
-        }
-    }
-    let line = |cells: [&str; 3]| {
-        let pad = |i: usize| " ".repeat(widths[i] - crate::editor::str_width(cells[i]));
-        format!(
-            "{}{} | {}{} | {}{}\n",
-            cells[0],
-            pad(0),
-            cells[1],
-            pad(1),
-            pad(2),
-            cells[2]
-        )
-    };
-    let mut s = line(header);
-    for row in rows {
-        s.push_str(&line([&row[0], &row[1], &row[2]]));
-    }
-    s
 }
 
 const HELP: &str = "\
@@ -948,8 +914,15 @@ Built-ins:
 Files and text (they read files, or a pipe or < file when given none):
   cat  head [-n N]  tail [-n N]  wc [-l -w -c]  sort [-r -n -f -u]  uniq [-c]
   grep [-i -v -n -c -F] PATTERN   tee [-a] file
+  cut -f LIST [-d D] | -c LIST    tr SET1 SET2 | tr -d SET   seq [FIRST [STEP]] LAST
   mkdir [-p]  touch  cp [-r]  mv  rm [-r -f]  basename  dirname  realpath
-  sleep secs   open file-or-url (in its usual app)
+  find [path] [-name GLOB] [-iname GLOB] [-type f|d] [-maxdepth N]
+  du [path...]  sizes        df   free space on each drive
+  ps   running programs      kill [-9] PID...
+  date [+FORMAT]   time COMMAND (how long it took)   sleep secs
+  open file-or-url (in its usual app)
+In the terminal, cat, head, tail and grep show their text in a box, so it
+stands apart from what you typed (piped or saved, it's left as is).
 
 Pictures:
   img [-k | -s | -b] [-w columns] picture   kitty graphics, sixel, or
@@ -970,6 +943,7 @@ mod tests {
 
     #[test]
     fn sizes_read_like_explorer() {
+        use commands::human_size;
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(1023), "1023 B");
         assert_eq!(human_size(1536), "1.50 KB");
