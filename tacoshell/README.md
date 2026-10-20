@@ -12,6 +12,23 @@ cargo run -p tacoshell
 `tacoterm.exe`; tacoterm then offers it under right-click → shell and on the
 settings page (or set `shell = "tacoshell.exe"` in `config.toml`).
 
+## Install
+
+Each CI run on Windows builds `tacoshell-setup-<version>.exe` (download the
+`tacoshell-setup` artifact). It installs for you alone without asking for
+admin rights (or for everyone, if you pick that), and can:
+
+- put tacoshell on PATH, so tacoterm lists it as a shell and any terminal
+  can start it
+- add a tacoshell profile to Windows Terminal
+- add it to the Start menu
+
+Uninstalling (Settings → Apps) takes all of that back out. For a silent
+install: `tacoshell-setup-0.1.0.exe /VERYSILENT /CURRENTUSER`. To build the
+installer yourself, install [Inno Setup 6](https://jrsoftware.org/isinfo.php),
+run `cargo build --release -p tacoshell`, then
+`iscc tacoshell\installer\tacoshell.iss`.
+
 ## What works
 
 - Pipes `a | b`, `a && b`, `a || b`, `a ; b` (and cmd's `a & b`)
