@@ -7,7 +7,8 @@ use tacoterm::config::Config;
 use tacoterm::grid::Grid;
 use tacoterm::layout::{Layout, Rect, Split};
 use tacoterm::renderer::{
-    Control, Fonts, Frame, PaneView, Renderer, SearchBar, SettingsPage, SettingsRow, TabHit,
+    Control, Fonts, Frame, Hint, PaletteView, PaneView, Renderer, SearchBar, SettingsPage,
+    SettingsRow, TabHit,
 };
 use tacoterm::settings::{preview_text, Kind, Settings};
 use tacoterm::vt::Vt;
@@ -128,6 +129,7 @@ fn renders_tabs_splits_search_and_box_drawing() {
                 matches: if i == 0 { &matches } else { &[] },
                 current_match: Some(0),
                 link: None,
+                hints: &[],
             })
             .collect(),
         dividers: layout.dividers(area, gap),
@@ -141,6 +143,7 @@ fn renders_tabs_splits_search_and_box_drawing() {
         cursor_on: true,
         flash: false,
         settings: None,
+        palette: None,
     };
     assert!(renderer.render(&frame));
     let pixels = renderer.read_pixels().unwrap();
@@ -304,6 +307,7 @@ fn renders_settings_page_and_window_buttons() {
         cursor_on: true,
         flash: false,
         settings: Some(page(rows.clone())),
+        palette: None,
     };
     assert!(renderer.render(&frame));
     let pixels = renderer.read_pixels().unwrap();
@@ -329,6 +333,120 @@ fn renders_settings_page_and_window_buttons() {
         "{:?}",
         &pixels[i..i + 3]
     );
+}
+
+#[test]
+fn renders_command_palette_and_quick_select_labels() {
+    let config = Config {
+        color_scheme: "campbell".into(),
+        padding: 4,
+        ..Config::default()
+    };
+    let fonts = Fonts::new(&config, 1.0);
+    let (cw, ch) = (fonts.cell_width, fonts.cell_height);
+    let (w, h) = (80 * cw + 8, 24 * ch + 8);
+    let mut renderer = match Renderer::headless(w, h, fonts, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+    };
+    let (cols, rows) = renderer.grid_size();
+    let mut grid = Grid::new(cols as usize, rows as usize, 100);
+    Vt::new().advance(
+        &mut grid,
+        "\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\nopen https://example.com and ./src/main.rs".as_bytes(),
+    );
+    let hints: Vec<Hint> = grid
+        .quick_targets()
+        .into_iter()
+        .zip(["a", "s"])
+        .map(|((m, _), l)| Hint {
+            start: m.start,
+            end: m.end,
+            label: l.into(),
+        })
+        .collect();
+    assert_eq!(hints.len(), 2);
+    let full = Rect::new(0.0, 0.0, w as f32, h as f32);
+    let mut frame = Frame::single(&grid, full);
+    frame.panes[0].hints = &hints;
+    frame.palette = Some(PaletteView {
+        placeholder: "Type a command",
+        query: "spl",
+        items: vec![
+            ("Split right", "Ctrl+Shift+D"),
+            ("Split down", "Ctrl+Shift+E"),
+        ],
+        selected: 0,
+    });
+    assert!(renderer.render(&frame));
+    let pixels = renderer.read_pixels().unwrap();
+    save_snapshot("TACOTERM_SNAPSHOT_PALETTE", &pixels, w, h);
+    let px = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        (pixels[i], pixels[i + 1], pixels[i + 2])
+    };
+    // The label box sits on the first target in bright yellow (shaded by
+    // the palette's backdrop, so just check it is the yellowest thing).
+    let y = 4 + 17 * ch + 1;
+    let x = 4 + 5 * cw + cw - 2;
+    let (r, g, b) = px(x, y);
+    assert!(
+        r > b + 40 && g > b + 40,
+        "label box at {x},{y}: {:?}",
+        (r, g, b)
+    );
+    // The palette card is lighter than the shaded terminal behind it.
+    let mid = px(w / 2, ch * 4);
+    let edge = px(2, ch * 4);
+    assert!(mid.0 > edge.0, "card {mid:?} vs backdrop {edge:?}");
+}
+
+#[test]
+fn renders_background_picture_under_the_text() {
+    let path = std::env::temp_dir().join(format!("tacoterm-bg-{}.png", std::process::id()));
+    image::RgbaImage::from_pixel(8, 4, image::Rgba([200, 0, 0, 255]))
+        .save(&path)
+        .unwrap();
+    let config = Config {
+        color_scheme: "campbell".into(),
+        background_image: path.to_string_lossy().into_owned(),
+        background_image_opacity: 0.5,
+        ..Config::default()
+    };
+    assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    let fonts = Fonts::new(&config, 1.0);
+    let (w, h) = (20 * fonts.cell_width, 4 * fonts.cell_height);
+    let mut renderer = match Renderer::headless(w, h, fonts, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    };
+    let mut grid = Grid::new(20, 4, 0);
+    Vt::new().advance(&mut grid, b"\x1b[44m  \x1b[0m");
+    let full = Rect::new(0.0, 0.0, w as f32, h as f32);
+    assert!(renderer.render(&Frame::single(&grid, full)));
+    let pixels = renderer.read_pixels().unwrap();
+    let _ = std::fs::remove_file(&path);
+    let px = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        (pixels[i], pixels[i + 1], pixels[i + 2])
+    };
+    // Half red over the near-black background.
+    let (r, g, b) = px(w - 2, h - 2);
+    assert!(
+        (95..=115).contains(&r) && g < 20 && b < 20,
+        "{:?}",
+        (r, g, b)
+    );
+    // A colored cell background sits on top of the picture.
+    let (r, _, b) = px(14, 14);
+    assert!(b > 150 && r < 40, "{:?}", (r, b));
 }
 
 fn save_snapshot(var: &str, pixels: &[u8], w: u32, h: u32) {

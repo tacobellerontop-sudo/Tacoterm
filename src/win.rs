@@ -1,16 +1,26 @@
 //! Small Win32 helpers: the window handle, see-through frames, the bell,
-//! opening links and the global summon hotkey.
+//! opening links, the global summon hotkey, notifications and taskbar
+//! progress.
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MB_OK, MSG, SW_SHOWNORMAL, WM_HOTKEY};
+use windows::Win32::UI::Shell::{
+    ITaskbarList3, ShellExecuteW, Shell_NotifyIconW, TaskbarList, NIF_ICON, NIF_INFO, NIF_TIP,
+    NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, TBPF_ERROR, TBPF_INDETERMINATE,
+    TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetMessageW, LoadIconW, IDI_APPLICATION, MB_OK, MSG, SW_SHOWNORMAL, WM_HOTKEY,
+};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -128,4 +138,90 @@ pub fn register_hotkey(spec: &str, pressed: impl Fn() + Send + 'static) -> Resul
         }
     });
     rx.recv().unwrap_or(Err("hotkey thread died".to_string()))
+}
+
+// ---- notifications ---------------------------------------------------------
+
+/// The tray icon notifications come from, once one has been shown.
+static TRAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn copy_wide<const N: usize>(dst: &mut [u16; N], text: &str) {
+    for (d, s) in dst
+        .iter_mut()
+        .zip(text.encode_utf16().take(N - 1).chain([0]))
+    {
+        *d = s;
+    }
+}
+
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        ..Default::default()
+    };
+    copy_wide(&mut nid.szTip, "tacoterm");
+    nid
+}
+
+/// Show a desktop notification (a program's OSC 9 / OSC 777).
+pub fn notify(window: &Window, title: &str, body: &str) {
+    let Some(hwnd) = hwnd(window) else { return };
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_INFO | NIF_ICON | NIF_TIP;
+    nid.hIcon = unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default();
+    copy_wide(
+        &mut nid.szInfoTitle,
+        if title.is_empty() { "tacoterm" } else { title },
+    );
+    copy_wide(&mut nid.szInfo, body);
+    nid.dwInfoFlags = NIIF_INFO;
+    unsafe {
+        let shown = TRAY.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = Shell_NotifyIconW(if shown { NIM_MODIFY } else { NIM_ADD }, &nid);
+    }
+}
+
+/// Take the notification icon out of the tray (on exit).
+pub fn remove_tray(window: &Window) {
+    let Some(hwnd) = hwnd(window) else { return };
+    if TRAY.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+        }
+    }
+}
+
+// ---- taskbar progress ------------------------------------------------------
+
+thread_local! {
+    static TASKBAR: Option<ITaskbarList3> = unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let list: Option<ITaskbarList3> =
+            CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER).ok();
+        list.filter(|l| l.HrInit().is_ok())
+    };
+}
+
+/// Show a program's progress (ConEmu's OSC 9;4) on the taskbar button:
+/// state 0 clears, 1 normal, 2 error, 3 indeterminate, 4 paused.
+pub fn set_progress(window: &Window, state: u8, percent: u8) {
+    let Some(hwnd) = hwnd(window) else { return };
+    let flag = match state {
+        1 => TBPF_NORMAL,
+        2 => TBPF_ERROR,
+        3 => TBPF_INDETERMINATE,
+        4 => TBPF_PAUSED,
+        _ => TBPF_NOPROGRESS,
+    };
+    TASKBAR.with(|t| {
+        let Some(t) = t else { return };
+        unsafe {
+            let _ = t.SetProgressState(hwnd, flag);
+            if matches!(state, 1 | 2 | 4) {
+                let _ = t.SetProgressValue(hwnd, percent.min(100) as u64, 100);
+            }
+        }
+    });
 }

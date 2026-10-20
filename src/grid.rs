@@ -4,7 +4,8 @@
 //! The VT parser writes through this; the renderer reads from it. No
 //! rendering code lives here — just the buffer and cursor bookkeeping.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
 
 use unicode_width::UnicodeWidthChar;
 
@@ -21,6 +22,96 @@ pub enum Color {
     Indexed(u8),
     /// Truecolor from SGR 38;2 / 48;2.
     Rgb(u8, u8, u8),
+}
+
+// ---- clusters and links -----------------------------------------------------
+
+/// Strings kept once and handed out as small ids, shared by every grid so a
+/// renderer's glyph cache can key on them.
+#[derive(Default)]
+struct Interner {
+    list: Vec<String>,
+    ids: HashMap<String, u32>,
+}
+
+impl Interner {
+    fn intern(&mut self, s: &str, max: usize) -> Option<u32> {
+        if let Some(&id) = self.ids.get(s) {
+            return Some(id);
+        }
+        if self.list.len() >= max {
+            return None;
+        }
+        let id = self.list.len() as u32;
+        self.list.push(s.to_string());
+        self.ids.insert(s.to_string(), id);
+        Some(id)
+    }
+}
+
+fn clusters() -> &'static Mutex<Interner> {
+    static CLUSTERS: OnceLock<Mutex<Interner>> = OnceLock::new();
+    CLUSTERS.get_or_init(Default::default)
+}
+
+fn links() -> &'static Mutex<Interner> {
+    static LINKS: OnceLock<Mutex<Interner>> = OnceLock::new();
+    LINKS.get_or_init(|| {
+        // Id 0 means "no link".
+        let mut i = Interner::default();
+        i.intern("", 1);
+        Mutex::new(i)
+    })
+}
+
+/// A cell holding more than one character (a letter and its accents, an
+/// emoji sequence) stores a stand-in from Supplementary Private Use
+/// Area-B, numbered into a shared table.
+const CLUSTER_BASE: u32 = 0x10_0000;
+const MAX_CLUSTERS: usize = 0xfffd;
+
+/// The characters a cell's `c` stands for, if it is a cluster stand-in.
+pub fn cluster_text(c: char) -> Option<String> {
+    let id = (c as u32).checked_sub(CLUSTER_BASE)? as usize;
+    clusters().lock().ok()?.list.get(id).cloned()
+}
+
+/// Append what `c` shows to `out`.
+pub fn push_cell_text(out: &mut String, c: char) {
+    match cluster_text(c) {
+        Some(s) => out.push_str(&s),
+        None => out.push(c),
+    }
+}
+
+/// The first character of what `c` shows.
+pub fn base_char(c: char) -> char {
+    cluster_text(c).and_then(|s| s.chars().next()).unwrap_or(c)
+}
+
+fn cluster_char(s: &str) -> Option<char> {
+    let id = clusters().lock().ok()?.intern(s, MAX_CLUSTERS)?;
+    char::from_u32(CLUSTER_BASE + id)
+}
+
+/// The URL of an OSC 8 hyperlink id.
+pub fn link_url(id: u16) -> Option<String> {
+    if id == 0 {
+        return None;
+    }
+    links().lock().ok()?.list.get(id as usize).cloned()
+}
+
+/// The id for an OSC 8 hyperlink to `url` (0 when the table is full).
+pub fn link_id(url: &str) -> u16 {
+    if url.is_empty() {
+        return 0;
+    }
+    links()
+        .lock()
+        .ok()
+        .and_then(|mut l| l.intern(url, u16::MAX as usize))
+        .unwrap_or(0) as u16
 }
 
 /// Text attributes, packed as bitflags.
@@ -43,6 +134,16 @@ impl Attr {
     /// character after it didn't fit. Not part of the text: copying, search
     /// and reflow skip it.
     pub const WIDE_PAD: u16 = 1 << 10;
+    /// Underline styles beyond the plain line (SGR 4:2 to 4:5, 21). At most
+    /// one is set, along with UNDERLINE.
+    pub const DOUBLE_UNDERLINE: u16 = 1 << 11;
+    pub const CURLY_UNDERLINE: u16 = 1 << 12;
+    pub const DOTTED_UNDERLINE: u16 = 1 << 13;
+    pub const DASHED_UNDERLINE: u16 = 1 << 14;
+    pub const UNDERLINE_STYLES: u16 = Self::DOUBLE_UNDERLINE
+        | Self::CURLY_UNDERLINE
+        | Self::DOTTED_UNDERLINE
+        | Self::DASHED_UNDERLINE;
 
     pub fn set(&mut self, flag: u16, on: bool) {
         if on {
@@ -59,10 +160,15 @@ impl Attr {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
+    /// The character, or a stand-in for several (see [`cluster_text`]).
     pub c: char,
     pub fg: Color,
     pub bg: Color,
     pub attr: Attr,
+    /// Underline color (SGR 58); `Default` follows the text color.
+    pub ul: Color,
+    /// OSC 8 hyperlink (see [`link_url`]); 0 for none.
+    pub link: u16,
 }
 
 impl Default for Cell {
@@ -72,6 +178,8 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             attr: Attr::default(),
+            ul: Color::Default,
+            link: 0,
         }
     }
 }
@@ -83,6 +191,8 @@ impl Cell {
             fg: pen.fg,
             bg: pen.bg,
             attr: pen.attr,
+            ul: pen.ul,
+            link: pen.link,
         }
     }
 
@@ -102,6 +212,9 @@ pub struct Pen {
     pub fg: Color,
     pub bg: Color,
     pub attr: Attr,
+    pub ul: Color,
+    /// The OSC 8 hyperlink being written, 0 for none. Not reset by SGR 0.
+    pub link: u16,
 }
 
 /// One line of cells. `wrapped` means the line continues on the next one
@@ -110,6 +223,8 @@ pub struct Pen {
 pub struct Row {
     pub cells: Vec<Cell>,
     pub wrapped: bool,
+    /// A shell prompt starts on this row (OSC 133;A).
+    pub prompt: bool,
 }
 
 impl Row {
@@ -117,6 +232,7 @@ impl Row {
         Row {
             cells: vec![fill; cols],
             wrapped: false,
+            prompt: false,
         }
     }
 }
@@ -250,6 +366,51 @@ fn is_url_char(c: char) -> bool {
         && !"<>`{}|^".contains(c)
         // Box drawing and block elements: TUI borders, never URL text.
         && !('\u{2500}'..='\u{259f}').contains(&c)
+}
+
+/// Characters a quick-select candidate runs over: spaces, quotes and
+/// brackets split.
+fn is_token_char(c: char) -> bool {
+    is_url_char(c) && !"\"'()[]".contains(c)
+}
+
+/// The part of `token` quick select offers, as a range, if any.
+fn quick_target(token: &[char]) -> Option<(usize, usize)> {
+    if let Some(k) = (0..token.len()).find(|&k| url_prefix_at(token, k).is_some()) {
+        let end = k + trim_url_end(&token[k..]);
+        return (end > k + 4).then_some((k, end));
+    }
+    let mut end = token.len();
+    while end > 0 && ".,;:!?".contains(token[end - 1]) {
+        end -= 1;
+    }
+    let t = &token[..end];
+    let s: String = t.iter().collect();
+    let hex = |c: &char| c.is_ascii_hexdigit();
+    let is_hash = (7..=64).contains(&t.len())
+        && t.iter().all(hex)
+        && t.iter().any(char::is_ascii_digit)
+        && t.iter().any(char::is_ascii_alphabetic);
+    let is_uuid = t.len() == 36
+        && t.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    let is_ip = {
+        let addr = s.split(':').next().unwrap_or("");
+        let parts: Vec<&str> = addr.split('.').collect();
+        parts.len() == 4
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.parse::<u8>().is_ok())
+    };
+    let is_number = t.len() >= 4 && t.iter().all(char::is_ascii_digit);
+    let is_path = t.len() >= 3
+        && t.iter().any(|&c| c == '/' || c == '\\')
+        && t.iter().any(|c| c.is_alphanumeric())
+        && !t.starts_with(&['-'])
+        && t.iter().all(|&c| is_word_char(c) || c == ',');
+    (is_hash || is_uuid || is_ip || is_number || is_path).then_some((0, end))
 }
 
 /// URL prefixes [`Grid::url_at`] recognizes, matched case-insensitively.
@@ -417,9 +578,10 @@ impl Grid {
     /// double-width characters.
     pub fn put_char(&mut self, c: char) {
         let width = c.width().unwrap_or(0);
-        if width == 0 {
-            // Combining marks and other zero-width characters: dropped for
-            // now (they would need cells holding more than one char).
+        if width == 0 || self.joins_previous(c) {
+            // Accents, variation selectors, emoji joined with ZWJ, flags:
+            // part of the character before.
+            self.append_to_previous(c);
             return;
         }
         if self.wrap_pending && self.modes.autowrap {
@@ -463,6 +625,65 @@ impl Grid {
             self.wrap_pending = self.modes.autowrap;
         } else {
             self.cursor_x = next;
+        }
+    }
+
+    /// The cell the last character went into.
+    fn previous_cell(&self) -> Option<(usize, usize)> {
+        let y = self.cursor_y;
+        let x = if self.wrap_pending {
+            self.cursor_x
+        } else {
+            self.cursor_x.checked_sub(1)?
+        };
+        let cells = &self.screen[y].cells;
+        if cells.get(x)?.attr.has(Attr::WIDE_SPACER) && x > 0 {
+            return Some((x - 1, y));
+        }
+        Some((x, y))
+    }
+
+    /// Whether `c` (which has a width) continues the character before: the
+    /// next emoji of a ZWJ sequence, or a flag's second letter.
+    fn joins_previous(&self, c: char) -> bool {
+        let Some((x, y)) = self.previous_cell() else {
+            return false;
+        };
+        let before = self.screen[y].cells[x].c;
+        let text = cluster_text(before).unwrap_or_else(|| before.to_string());
+        let regional = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+        text.ends_with('\u{200D}') || (regional(c) && text.chars().count() == 1 && regional(before))
+    }
+
+    fn append_to_previous(&mut self, c: char) {
+        let Some((x, y)) = self.previous_cell() else {
+            return;
+        };
+        let cell = self.screen[y].cells[x];
+        let mut text = cluster_text(cell.c).unwrap_or_else(|| cell.c.to_string());
+        if text.chars().count() >= 32 {
+            return;
+        }
+        text.push(c);
+        let Some(stand_in) = cluster_char(&text) else {
+            return;
+        };
+        self.screen[y].cells[x].c = stand_in;
+        // VS16 asks for emoji presentation, which is two cells wide.
+        let narrow = !cell.attr.has(Attr::WIDE);
+        let emoji_like = base_char(cell.c) as u32 >= 0x2000;
+        if c == '\u{FE0F}' && narrow && emoji_like && !self.wrap_pending && x + 1 < self.cols {
+            self.screen[y].cells[x].attr.set(Attr::WIDE, true);
+            self.clear_wide_at(x + 1, y);
+            let mut spacer = Cell::with_pen(' ', &self.pen);
+            spacer.attr.set(Attr::WIDE_SPACER, true);
+            self.screen[y].cells[x + 1] = spacer;
+            if x + 2 >= self.cols {
+                self.cursor_x = self.cols - 1;
+                self.wrap_pending = self.modes.autowrap;
+            } else {
+                self.cursor_x = x + 2;
+            }
         }
     }
 
@@ -724,6 +945,7 @@ impl Grid {
                 for row in &mut self.screen {
                     row.cells.fill(blank);
                     row.wrapped = false;
+                    row.prompt = false;
                 }
                 self.selection = None;
                 let first = self.screen_line(0);
@@ -888,8 +1110,11 @@ impl Grid {
         let mut out: Vec<Row> = Vec::new();
         // (row in `out`, col, wrap pending)
         let mut cursor = (0, 0, false);
+        // Old row index -> new row index.
+        let mut moved = vec![0; old.len()];
         let mut i = 0;
         while i < old.len() {
+            let (first_old, first_new, prompt) = (i, out.len(), old[i].prompt);
             // Join one logical line, noting where the cursor falls in it.
             let mut cells: Vec<Cell> = Vec::new();
             let mut cursor_at = None;
@@ -938,6 +1163,7 @@ impl Grid {
                     out.push(Row {
                         cells: std::mem::replace(&mut row, Vec::with_capacity(cols)),
                         wrapped: true,
+                        prompt: false,
                     });
                 }
                 if cursor_at == Some(k) {
@@ -975,7 +1201,14 @@ impl Grid {
             out.push(Row {
                 cells: row,
                 wrapped: false,
+                prompt: false,
             });
+            // Where this logical line's rows went, for prompts and pictures.
+            out[first_new].prompt = prompt;
+            let made = out.len() - first_new;
+            for (k, to) in moved[first_old..i].iter_mut().enumerate() {
+                *to = first_new + k.min(made - 1);
+            }
         }
         for row in &mut out {
             row.cells.resize(cols, Cell::default());
@@ -990,12 +1223,61 @@ impl Grid {
         screen.truncate(rows);
         screen.resize(rows, Row::new(cols, Cell::default()));
         let excess = out.len().saturating_sub(self.scrollback_limit);
+        // History lines keep counting from the same place, so a picture's
+        // line maps through `moved`.
+        let first = self.lines_dropped;
+        for p in &mut self.graphics.placements {
+            if let Some(&to) = p.line.checked_sub(first).and_then(|k| moved.get(k)) {
+                p.line = first + to;
+            }
+        }
         self.lines_dropped += excess;
+        self.drop_old_images();
         self.scrollback = out.into_iter().skip(excess).collect();
         self.screen = screen;
         self.cursor_x = cursor.1;
         self.cursor_y = cursor.0 - start;
         self.wrap_pending = cursor.2;
+    }
+
+    // ---- shell integration ----------------------------------------------
+
+    /// OSC 133;A: a prompt starts on the cursor's row.
+    pub fn mark_prompt(&mut self) {
+        let y = self.cursor_y;
+        self.screen[y].prompt = true;
+    }
+
+    /// History lines where prompts start, oldest first.
+    pub fn prompt_lines(&self) -> Vec<usize> {
+        self.scrollback
+            .iter()
+            .chain(self.screen.iter())
+            .enumerate()
+            .filter(|(_, r)| r.prompt)
+            .map(|(i, _)| self.lines_dropped + i)
+            .collect()
+    }
+
+    /// Scroll so the previous (`up`) or next prompt is at the top of the
+    /// view. Returns false when there is none that way.
+    pub fn scroll_to_prompt(&mut self, up: bool) -> bool {
+        let top = self.view_top();
+        let lines = self.prompt_lines();
+        let target = if up {
+            lines.into_iter().rev().find(|&l| l < top)
+        } else {
+            lines.into_iter().find(|&l| l > top)
+        };
+        let Some(line) = target else {
+            if !up {
+                self.display_offset = 0;
+            }
+            return false;
+        };
+        let end = self.lines_dropped + self.scrollback.len();
+        self.display_offset = end.saturating_sub(line).min(self.scrollback.len());
+        true
     }
 
     // ---- view + selection -----------------------------------------------
@@ -1078,7 +1360,7 @@ impl Grid {
             for (col, cell) in row.cells.iter().enumerate() {
                 let pad = row.wrapped && cell.attr.has(Attr::WIDE_PAD);
                 if !pad && !cell.attr.has(Attr::WIDE_SPACER) {
-                    out.push((Point { line, col }, cell.c));
+                    out.push((Point { line, col }, base_char(cell.c)));
                 }
             }
         }
@@ -1212,8 +1494,10 @@ impl Grid {
                 .skip(from)
                 .filter(|c| !c.attr.has(Attr::WIDE_SPACER))
                 .filter(|c| !(row.wrapped && c.attr.has(Attr::WIDE_PAD)))
-                .map(|c| c.c)
-                .collect();
+                .fold(String::new(), |mut s, c| {
+                    push_cell_text(&mut s, c.c);
+                    s
+                });
             let joins_next = row.wrapped && line != end.line;
             if !joins_next {
                 text.truncate(text.trim_end().len());
@@ -1265,6 +1549,70 @@ impl Grid {
             line = last + 1;
         }
         matches
+    }
+
+    /// The OSC 8 hyperlink at `p`, or else a URL written out in the text:
+    /// the link and its first and last cell.
+    pub fn link_at(&self, p: Point) -> Option<(String, Point, Point)> {
+        let row = self.row_at(p.line)?;
+        let id = row.cells.get(p.col)?.link;
+        if id == 0 {
+            return self.url_at(p);
+        }
+        let url = link_url(id)?;
+        let same = |c: &Cell| c.link == id;
+        let start = row.cells[..p.col]
+            .iter()
+            .rev()
+            .take_while(|c| same(c))
+            .count();
+        let end = row.cells[p.col..].iter().take_while(|c| same(c)).count();
+        Some((
+            url,
+            Point {
+                line: p.line,
+                col: p.col - start,
+            },
+            Point {
+                line: p.line,
+                col: p.col + end - 1,
+            },
+        ))
+    }
+
+    /// Things on screen worth copying, top to bottom, for quick select:
+    /// URLs, file paths, git hashes, UUIDs, IP addresses and numbers of
+    /// four or more digits, each with its text.
+    pub fn quick_targets(&self) -> Vec<(Match, String)> {
+        let top = self.viewport_point(0, 0).line;
+        let bottom = (top + self.rows).min(self.history_end());
+        let mut out = Vec::new();
+        let mut line = top;
+        while line < bottom {
+            let (first, last) = self.logical_bounds(line);
+            let cells = self.logical_cells(first, last);
+            let mut i = 0;
+            while i < cells.len() {
+                if !is_token_char(cells[i].1) {
+                    i += 1;
+                    continue;
+                }
+                let j = i + cells[i..]
+                    .iter()
+                    .take_while(|&&(_, c)| is_token_char(c))
+                    .count();
+                let token: Vec<char> = cells[i..j].iter().map(|&(_, c)| c).collect();
+                if let Some((a, b)) = quick_target(&token) {
+                    let (start, end) = (cells[i + a].0, cells[i + b - 1].0);
+                    if start.line < bottom && end.line >= top {
+                        out.push((Match { start, end }, token[a..b].iter().collect()));
+                    }
+                }
+                i = j;
+            }
+            line = last + 1;
+        }
+        out
     }
 
     /// The URL under `p` with its first and last cell (inclusive), if any.
@@ -1695,6 +2043,30 @@ mod tests {
         assert_eq!(
             (row_text(&g, 0), row_text(&g, 1)),
             ("abc".into(), "".into())
+        );
+    }
+
+    #[test]
+    fn quick_select_finds_things_to_copy() {
+        let mut g = Grid::new(80, 3, 100);
+        type_str(
+            &mut g,
+            "see https://example.com/a. at C:\\src\\main.rs:12, 1a2b3c4d ok",
+        );
+        g.carriage_return();
+        g.line_feed();
+        type_str(&mut g, "ip 10.0.0.1:80 pid 31337 (./run.sh) word 12");
+        let texts: Vec<String> = g.quick_targets().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            texts,
+            [
+                "https://example.com/a",
+                "C:\\src\\main.rs:12",
+                "1a2b3c4d",
+                "10.0.0.1:80",
+                "31337",
+                "./run.sh"
+            ]
         );
     }
 }

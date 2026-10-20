@@ -10,10 +10,21 @@ side nothing is unusual — they talk to a console, as always.
 
 Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on the GPU:
 
+- **Command palette**: Ctrl+Shift+P lists every action (with its key), color
+  scheme and shell; type a few letters to filter, Enter runs it
+- **Quick select**: Ctrl+Shift+Space labels every URL, path, git hash, IP
+  and long number on screen; type a label to copy it (in capitals to paste
+  it too)
 - **Tabs**: Ctrl+Shift+T opens one (in the current folder), Ctrl+Tab /
-  Ctrl+Shift+Tab switch, click the tab strip, middle-click or × closes
+  Ctrl+Shift+Tab switch, click the tab strip, middle-click or × closes, drag
+  a tab to reorder, double-click to rename it; right-click + to pick the
+  shell for the new tab
 - **Split panes**: Alt+Shift+= splits right, Alt+Shift+- splits down,
-  Alt+arrows move between panes, Alt+Shift+arrows resize, Ctrl+Shift+W closes
+  Alt+arrows move between panes, Alt+Shift+arrows resize (or drag the
+  divider), Ctrl+Shift+W closes
+- **Shell integration**: Ctrl+Shift+Up / Down jump between prompts (OSC 133);
+  programs can show a notification (OSC 9, OSC 777) while tacoterm is in
+  the background and drive the taskbar progress bar (OSC 9;4)
 - **Transparency**: the whole window, title bar included, with `opacity`
   plus Windows 11 acrylic / mica backgrounds. tacoterm draws its own title
   bar into the tab strip (drag it, double-click to maximize, snap works);
@@ -21,7 +32,13 @@ Tabs and split panes onto PowerShell (the default), `cmd.exe` or WSL, drawn on t
 - **Settings page**: the ⚙ in the title bar or Ctrl+, opens every setting
   beside a live preview
 - **Find in scrollback**: Ctrl+Shift+F; Enter / Shift+Enter step through hits
-- **Links**: Ctrl+click a URL to open it (it underlines while Ctrl is held)
+- **Links**: Ctrl+click a URL or an OSC 8 hyperlink to open it (it underlines
+  while Ctrl is held)
+- **Text**: emoji sequences (👍🏽, 👨‍👩‍👧, flags) and combining accents in one
+  cell; curly, double, dotted and dashed underlines in any color (as
+  editors use for errors)
+- **Background picture**: `background_image` puts a wallpaper behind the
+  text, faded by `background_image_opacity`
 - **Mouse**: drag, double-click a word, triple-click a line, Shift+click
   extends; apps like vim, htop and tmux get mouse events (hold Shift to
   select instead)
@@ -92,6 +109,8 @@ font_size = 14.0
 padding = 10
 opacity = 0.85                   # 1.0 is solid
 backdrop = "acrylic"             # none, acrylic, mica or tabbed (Windows 11)
+background_image = "~/Pictures/wall.jpg"
+background_image_opacity = 0.25
 
 shell = "auto"                   # PowerShell; or "cmd.exe", "wsl.exe ~", …
 prompt = "arrow"                 # styled; "classic" = the shell's own
@@ -110,6 +129,9 @@ paste = "ctrl+shift+v"
 new_tab = "ctrl+shift+t"
 split_right = "alt+shift+="
 find = "ctrl+shift+f"
+command_palette = "ctrl+shift+p"
+quick_select = "ctrl+shift+space"
+previous_prompt = "ctrl+shift+up"
 ```
 
 The file tacoterm writes on first run lists every key and binding.
@@ -121,6 +143,7 @@ The file tacoterm writes on first run lists every key and binding.
 | `src/main.rs` | Entry point (Windows binary) |
 | `src/app.rs` | winit event loop, tabs and panes, mouse/keyboard, find |
 | `src/app/page.rs` | The settings page: input and live preview |
+| `src/app/palette.rs` | Command palette and quick select |
 | `src/menu.rs` | The right-click menu |
 | `src/win.rs` | Win32 bits: summon hotkey, backdrop, links, beep |
 | `src/pty.rs` | ConPTY wrapper: spawn, resize, write, exit watch |
@@ -143,7 +166,8 @@ The file tacoterm writes on first run lists every key and binding.
 - [x] GPU renderer, box drawing, transparency
 - [x] Tabs, splits, find, links, mouse reporting, reflow, quake mode
 - [x] See-through title bar, settings page with live preview
-- [ ] Per-row damage tracking, OSC 8 hyperlinks, dragging pane dividers
+- [x] OSC 8 hyperlinks, dragging pane dividers, command palette, quick select
+- [ ] Per-row damage tracking
 - [ ] A shell of our own
 
 ## License

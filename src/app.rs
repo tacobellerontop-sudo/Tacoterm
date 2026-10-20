@@ -35,6 +35,7 @@ use tacoterm::schemes;
 use tacoterm::vt::Vt;
 
 mod page;
+mod palette;
 
 use crate::menu;
 use crate::pty::Pty;
@@ -199,11 +200,15 @@ struct Pane {
     title: String,
     /// The shell's working directory, when its prompt reports it.
     cwd: Option<String>,
+    /// The `shell =` setting it was started from; splits start the same.
+    shell: String,
 }
 
 struct Tab {
     layout: Layout,
     focused: PaneId,
+    /// A name the user gave the tab, shown instead of the shell's title.
+    name: Option<String>,
 }
 
 /// The find box.
@@ -275,6 +280,21 @@ struct App {
     title_click: Option<Instant>,
     /// The tab-strip control under the mouse.
     tab_hover: Option<TabHit>,
+    /// The command palette, while it is open.
+    palette: Option<palette::Palette>,
+    /// Quick select, while it is labelling the screen.
+    quick: Option<palette::QuickSelect>,
+    /// A divider or tab being dragged with the left button.
+    drag: Option<Drag>,
+    /// The last click on a tab, to catch double-clicks (rename).
+    tab_click_at: Option<(usize, Instant)>,
+}
+
+#[derive(Clone, Copy)]
+enum Drag {
+    /// A divider, by its index in [`Layout::dividers`].
+    Divider(usize),
+    Tab(usize),
 }
 
 impl App {
@@ -318,6 +338,10 @@ impl App {
             custom_frame: false,
             title_click: None,
             tab_hover: None,
+            palette: None,
+            quick: None,
+            drag: None,
+            tab_click_at: None,
         }
     }
 
@@ -414,8 +438,13 @@ impl App {
         id: PaneId,
         (cols, rows): (u16, u16),
         cwd: Option<String>,
+        setting: &str,
     ) -> Result<(), String> {
-        let (shell, env) = self.config.shell_command();
+        let (shell, env) = Config {
+            shell: setting.to_string(),
+            ..self.config.clone()
+        }
+        .shell_command();
         // The shell inherits our environment (cmd.exe reads PROMPT there).
         std::env::remove_var("PROMPT");
         // How programs (tacoshell's img, chafa, …) tell what we can draw.
@@ -465,6 +494,7 @@ impl App {
                 pty,
                 title: shell_title(&shell),
                 cwd,
+                shell: setting.to_string(),
             },
         );
         Ok(())
@@ -477,14 +507,21 @@ impl App {
     }
 
     fn new_tab(&mut self) -> Result<(), String> {
+        let shell = self.config.shell.clone();
+        self.new_tab_with(&shell)
+    }
+
+    /// Open a tab running `shell` (a `shell =` setting).
+    fn new_tab_with(&mut self, shell: &str) -> Result<(), String> {
         let cwd = self.pane().and_then(|p| p.cwd.clone());
         let id = self.alloc_id();
         self.tabs.push(Tab {
             layout: Layout::new(id),
             focused: id,
+            name: None,
         });
         let size = self.size_for(self.content_area());
-        if let Err(e) = self.spawn_pane(id, size, cwd) {
+        if let Err(e) = self.spawn_pane(id, size, cwd, shell) {
             self.tabs.pop();
             return Err(e);
         }
@@ -499,12 +536,15 @@ impl App {
             return;
         };
         let cwd = self.pane().and_then(|p| p.cwd.clone());
+        let shell = self
+            .pane()
+            .map_or_else(|| self.config.shell.clone(), |p| p.shell.clone());
         let id = self.alloc_id();
         if !self.tabs[self.active].layout.split(focused, how, id) {
             return;
         }
         let size = self.rect_of(id).map_or((80, 24), |r| self.size_for(r));
-        match self.spawn_pane(id, size, cwd) {
+        match self.spawn_pane(id, size, cwd, &shell) {
             Ok(()) => {
                 self.tabs[self.active].focused = id;
                 self.close_search();
@@ -892,6 +932,8 @@ impl App {
         let mut bell = false;
         let mut clipboard = None;
         let mut title_changed = false;
+        let mut notifications = Vec::new();
+        let mut progress = None;
         for id in &touched {
             let Some(p) = self.panes.get_mut(id) else {
                 continue;
@@ -912,6 +954,23 @@ impl App {
             bell |= std::mem::take(&mut p.vt.bell);
             if let Some(text) = p.vt.clipboard.take() {
                 clipboard = Some(text);
+            }
+            if let Some(n) = p.vt.notification.take() {
+                notifications.push(n);
+            }
+            if let Some(pr) = p.vt.progress.take() {
+                progress = Some(pr);
+            }
+        }
+        if let Some(w) = &self.window {
+            // Notifications are for when you're looking elsewhere.
+            if !self.focused || self.hidden {
+                for (title, body) in &notifications {
+                    win::notify(w, title, body);
+                }
+            }
+            if let Some((state, percent)) = progress {
+                win::set_progress(w, state, percent);
             }
         }
         if let Some(text) = clipboard {
@@ -1083,6 +1142,14 @@ impl App {
                 }
             }
             Action::NextColorScheme => self.next_scheme(),
+            Action::PreviousPrompt | Action::NextPrompt => {
+                let up = action == Action::PreviousPrompt;
+                if let Some(p) = self.pane_mut() {
+                    p.grid.scroll_to_prompt(up);
+                }
+            }
+            Action::CommandPalette => self.open_palette(),
+            Action::QuickSelect => self.start_quick_select(),
             Action::OpenSettings if self.settings_open() => self.close_settings(false),
             Action::OpenSettings => self.open_settings(),
         }
@@ -1274,7 +1341,7 @@ impl App {
         let hover = if self.mods.control_key() {
             self.pane_under_mouse().and_then(|id| {
                 let p = self.point_under_mouse(id)?;
-                let (url, a, b) = self.panes.get(&id)?.grid.url_at(p)?;
+                let (url, a, b) = self.panes.get(&id)?.grid.link_at(p)?;
                 Some((id, url, a, b))
             })
         } else {
@@ -1308,7 +1375,25 @@ impl App {
             self.close_settings(false);
         }
         match (button, hit) {
-            (MouseButton::Left, Some(TabHit::Tab(i))) => self.switch_tab(i),
+            (MouseButton::Left, Some(TabHit::Tab(i))) => {
+                let now = Instant::now();
+                self.switch_tab(i);
+                if self
+                    .tab_click_at
+                    .is_some_and(|(t, at)| t == i && now - at < MULTI_CLICK)
+                {
+                    self.tab_click_at = None;
+                    self.rename_tab();
+                } else {
+                    self.tab_click_at = Some((i, now));
+                    self.drag = Some(Drag::Tab(i));
+                }
+            }
+            (MouseButton::Right, Some(TabHit::New)) => {
+                // Pick which shell the new tab runs.
+                self.open_palette();
+                self.palette_query("New tab: ");
+            }
             (MouseButton::Left, Some(TabHit::Close(i)))
             | (MouseButton::Middle, Some(TabHit::Tab(i))) => self.close_tab(i),
             (MouseButton::Left, Some(TabHit::New)) => self.run_action(Action::NewTab),
@@ -1344,6 +1429,9 @@ impl App {
     }
 
     fn close_window(&mut self) {
+        if let Some(w) = &self.window {
+            win::remove_tray(w);
+        }
         for p in self.panes.values_mut() {
             let _ = p.pty.terminate();
         }
@@ -1388,6 +1476,10 @@ impl App {
         if self.settings_open() {
             return self.settings_press();
         }
+        if let Some(i) = self.divider_under_mouse() {
+            self.drag = Some(Drag::Divider(i));
+            return;
+        }
         let Some(id) = self.pane_under_mouse() else {
             return;
         };
@@ -1431,6 +1523,7 @@ impl App {
     }
 
     fn left_release(&mut self) {
+        self.drag = None;
         if self.settings_open() {
             return self.settings_release();
         }
@@ -1457,7 +1550,11 @@ impl App {
                 Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => {
                     CursorIcon::NeswResize
                 }
-                None => CursorIcon::Default,
+                None => match self.divider_under_mouse().map(|i| self.divider_rect(i)) {
+                    Some(Some(d)) if d.h > d.w => CursorIcon::EwResize,
+                    Some(Some(_)) => CursorIcon::NsResize,
+                    _ => CursorIcon::Default,
+                },
             });
         }
         let hover = match (&self.renderer, edge) {
@@ -1475,10 +1572,76 @@ impl App {
         }
     }
 
+    /// The divider under the mouse in the active tab, if any.
+    fn divider_under_mouse(&self) -> Option<usize> {
+        if self.settings_open() || self.drag.is_some_and(|d| matches!(d, Drag::Tab(_))) {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        let (x, y) = (self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
+        let slack = self
+            .renderer
+            .as_ref()
+            .map_or(3.0, |r| r.scale() as f32 * 3.0);
+        tab.layout
+            .divider_at(self.content_area(), self.gap(), x, y, slack)
+    }
+
+    fn divider_rect(&self, index: usize) -> Option<Rect> {
+        let tab = self.tabs.get(self.active)?;
+        tab.layout
+            .dividers(self.content_area(), self.gap())
+            .get(index)
+            .copied()
+    }
+
+    /// Follow the mouse with a divider or tab being dragged.
+    fn drag_to(&mut self, drag: Drag) {
+        match drag {
+            Drag::Divider(i) => {
+                let Some(d) = self.divider_rect(i) else {
+                    return;
+                };
+                let gap = self.gap();
+                let pos = if d.h > d.w {
+                    self.mouse_pos.0 as f32
+                } else {
+                    self.mouse_pos.1 as f32
+                } - gap / 2.0;
+                let area = self.content_area();
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if tab.layout.drag_divider(area, gap, i, pos) {
+                        self.fit_all();
+                        self.redraw();
+                    }
+                }
+            }
+            Drag::Tab(i) => {
+                let hit = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.tab_hit(self.mouse_pos.0, self.mouse_pos.1, self.tabs.len()));
+                if let Some(TabHit::Tab(j) | TabHit::Close(j)) = hit {
+                    if j != i && j < self.tabs.len() {
+                        let tab = self.tabs.remove(i);
+                        self.tabs.insert(j, tab);
+                        self.active = j;
+                        self.drag = Some(Drag::Tab(j));
+                        self.tab_click_at = None;
+                        self.redraw();
+                    }
+                }
+            }
+        }
+    }
+
     fn mouse_moved(&mut self) {
         self.chrome_hover();
         if self.settings_open() {
             return self.settings_motion();
+        }
+        if let Some(drag) = self.drag {
+            return self.drag_to(drag);
         }
         if let Some((id, button)) = self.reported_button {
             self.report_mouse(id, button, MouseEventKind::Motion);
@@ -1693,12 +1856,17 @@ impl App {
                     Some(s) if focused => (&s.matches[..], s.current),
                     _ => (&[][..], None),
                 };
+                let hints = match &self.quick {
+                    Some(q) if q.pane() == *id => &q.hints[..],
+                    _ => &[][..],
+                };
                 Some(PaneView {
                     grid: &pane.grid,
                     rect: *rect,
                     focused,
                     matches,
                     current_match,
+                    hints,
                     link: self
                         .link
                         .as_ref()
@@ -1711,9 +1879,11 @@ impl App {
             self.tabs
                 .iter()
                 .map(|t| {
-                    self.panes
-                        .get(&t.focused)
-                        .map_or_else(String::new, |p| p.title.clone())
+                    t.name.clone().unwrap_or_else(|| {
+                        self.panes
+                            .get(&t.focused)
+                            .map_or_else(String::new, |p| p.title.clone())
+                    })
                 })
                 .collect()
         } else {
@@ -1732,6 +1902,7 @@ impl App {
             cursor_on: self.cursor_on,
             flash: self.flash_until.is_some_and(|t| Instant::now() < t),
             settings,
+            palette: self.palette.as_ref().map(|p| p.view()),
         };
         let Some(r) = &mut self.renderer else { return };
         if !r.render(&frame) {
@@ -1853,6 +2024,9 @@ impl ApplicationHandler<Wake> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                if let Some(w) = &self.window {
+                    win::remove_tray(w);
+                }
                 for p in self.panes.values_mut() {
                     let _ = p.pty.terminate();
                 }
@@ -1909,6 +2083,23 @@ impl ApplicationHandler<Wake> for App {
                             ) => self.run_action(a),
                             _ => self.settings_key(&event),
                         }
+                    } else if self.palette.is_some() {
+                        // The palette binding closes it; full screen and
+                        // zoom still work. Everything else is typing.
+                        match action {
+                            Some(
+                                a @ (Action::CommandPalette
+                                | Action::Fullscreen
+                                | Action::ZoomIn
+                                | Action::ZoomOut
+                                | Action::ZoomReset),
+                            ) => self.run_action(a),
+                            _ => self.palette_key(&event),
+                        }
+                    } else if self.quick.is_some()
+                        && action.is_none_or(|a| a != Action::QuickSelect)
+                    {
+                        self.quick_key(&event);
                     } else if let Some(action) = action {
                         self.run_action(action);
                     } else if !self.search_key(&event) {

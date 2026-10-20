@@ -48,6 +48,12 @@ pub struct Vt {
     /// The shell's working directory as last reported (OSC 7 / OSC 9;9),
     /// in Windows form when it names a drive (`C:\Users\me`).
     pub cwd: Option<String>,
+    /// A desktop notification the program asked for (OSC 9 / OSC 777):
+    /// title and body. The app takes it.
+    pub notification: Option<(String, String)>,
+    /// Progress for the taskbar (ConEmu's OSC 9;4): state 0 clear, 1
+    /// normal, 2 error, 3 indeterminate, 4 paused; percent.
+    pub progress: Option<(u8, u8)>,
     apc_state: Apc,
     apc: Vec<u8>,
     /// A sixel picture arriving in a DCS string.
@@ -69,6 +75,8 @@ impl Vt {
             bell: false,
             clipboard: None,
             cwd: None,
+            notification: None,
+            progress: None,
             apc_state: Apc::Normal,
             apc: Vec::new(),
             sixel: None,
@@ -152,6 +160,8 @@ impl Vt {
             bell: &mut self.bell,
             clipboard: &mut self.clipboard,
             cwd: &mut self.cwd,
+            notification: &mut self.notification,
+            progress: &mut self.progress,
             sixel: &mut self.sixel,
         };
         self.parser.advance(&mut performer, bytes);
@@ -173,6 +183,8 @@ struct Performer<'a> {
     bell: &'a mut bool,
     clipboard: &'a mut Option<String>,
     cwd: &'a mut Option<String>,
+    notification: &'a mut Option<(String, String)>,
+    progress: &'a mut Option<(u8, u8)>,
     sixel: &'a mut Option<Sixel>,
 }
 
@@ -229,7 +241,6 @@ impl Perform for Performer<'_> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // TODO: OSC 8 (links).
         let Some((&kind, rest)) = params.split_first() else {
             return;
         };
@@ -248,6 +259,35 @@ impl Perform for Performer<'_> {
                 if let Some(dir) = file_url_path(&joined(rest)) {
                     *self.cwd = Some(dir);
                 }
+            }
+            // Hyperlink: `8;params;URI` starts one, an empty URI ends it.
+            b"8" if !rest.is_empty() => {
+                let url = joined(&rest[1.min(rest.len())..]);
+                self.grid.pen.link = crate::grid::link_id(&url);
+            }
+            // Shell integration (FinalTerm / OSC 133): A starts a prompt.
+            b"133" if rest.first().is_some_and(|r| r.starts_with(b"A")) => {
+                self.grid.mark_prompt();
+            }
+            // ConEmu's taskbar progress: `9;4;state;percent`.
+            b"9" if rest.len() > 1 && rest[0] == b"4" => {
+                let num = |i: usize| {
+                    rest.get(i)
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .and_then(|s| s.parse::<u8>().ok())
+                        .unwrap_or(0)
+                };
+                *self.progress = Some((num(1).min(4), num(2).min(100)));
+            }
+            // A notification: `9;text` (iTerm2) or
+            // `777;notify;title;body` (urxvt, WezTerm).
+            // (ConEmu's numbered `9;n;…` commands are something else.)
+            b"9" if !rest.is_empty() && !rest[0].iter().all(u8::is_ascii_digit) => {
+                *self.notification = Some((String::new(), joined(rest)));
+            }
+            b"777" if rest.len() >= 2 && rest[0] == b"notify" => {
+                let title = String::from_utf8_lossy(rest[1]).into_owned();
+                *self.notification = Some((title, joined(&rest[2.min(rest.len())..])));
             }
             // ConEmu's `9;9;"path"`: working directory, quotes optional.
             b"9" if rest.len() > 1 && rest[0] == b"9" => {
@@ -560,8 +600,15 @@ pub(crate) fn base64_decode(data: &[u8]) -> Option<Vec<u8>> {
 /// SGR — select graphic rendition.
 fn sgr(g: &mut Grid, params: &Params) {
     let groups: Vec<&[u16]> = params.iter().collect();
+    // SGR 0 resets everything but the hyperlink, which only OSC 8 ends.
+    let reset = |g: &mut Grid| {
+        g.pen = Pen {
+            link: g.pen.link,
+            ..Pen::default()
+        }
+    };
     if groups.is_empty() {
-        g.pen = Pen::default();
+        reset(g);
         return;
     }
     let mut i = 0;
@@ -569,21 +616,40 @@ fn sgr(g: &mut Grid, params: &Params) {
         let n = groups[i].first().copied().unwrap_or(0);
         let attr = &mut g.pen.attr;
         match n {
-            0 => g.pen = Pen::default(),
+            0 => reset(g),
             1 => attr.set(Attr::BOLD, true),
             2 => attr.set(Attr::DIM, true),
             3 => attr.set(Attr::ITALIC, true),
-            4 => attr.set(Attr::UNDERLINE, true),
+            4 => {
+                // 4:n picks a style: 0 none, 1 single, 2 double, 3 curly,
+                // 4 dotted, 5 dashed.
+                let style = groups[i].get(1).copied().unwrap_or(1);
+                attr.set(Attr::UNDERLINE | Attr::UNDERLINE_STYLES, false);
+                let extra = match style {
+                    2 => Attr::DOUBLE_UNDERLINE,
+                    3 => Attr::CURLY_UNDERLINE,
+                    4 => Attr::DOTTED_UNDERLINE,
+                    5 => Attr::DASHED_UNDERLINE,
+                    _ => 0,
+                };
+                if style != 0 {
+                    attr.set(Attr::UNDERLINE | extra, true);
+                }
+            }
             7 => attr.set(Attr::INVERSE, true),
             8 => attr.set(Attr::HIDDEN, true),
             9 => attr.set(Attr::STRIKE, true),
-            21 => attr.set(Attr::UNDERLINE, true),
+            21 => {
+                attr.set(Attr::UNDERLINE_STYLES, false);
+                attr.set(Attr::UNDERLINE | Attr::DOUBLE_UNDERLINE, true);
+            }
             22 => {
                 attr.set(Attr::BOLD, false);
                 attr.set(Attr::DIM, false);
             }
             23 => attr.set(Attr::ITALIC, false),
-            24 => attr.set(Attr::UNDERLINE, false),
+            24 => attr.set(Attr::UNDERLINE | Attr::UNDERLINE_STYLES, false),
+            59 => g.pen.ul = Color::Default,
             27 => attr.set(Attr::INVERSE, false),
             28 => attr.set(Attr::HIDDEN, false),
             29 => attr.set(Attr::STRIKE, false),
@@ -593,13 +659,13 @@ fn sgr(g: &mut Grid, params: &Params) {
             49 => g.pen.bg = Color::Default,
             90..=97 => g.pen.fg = Color::Indexed((n - 90 + 8) as u8),
             100..=107 => g.pen.bg = Color::Indexed((n - 100 + 8) as u8),
-            38 | 48 => {
+            38 | 48 | 58 => {
                 let (color, used) = extended_color(&groups[i..]);
                 if let Some(color) = color {
-                    if n == 38 {
-                        g.pen.fg = color;
-                    } else {
-                        g.pen.bg = color;
+                    match n {
+                        38 => g.pen.fg = color,
+                        48 => g.pen.bg = color,
+                        _ => g.pen.ul = color,
                     }
                 }
                 i += used;
@@ -774,6 +840,67 @@ mod tests {
         // No intermediate: not DECSCUSR (it's DECLL), leave the shape alone.
         feed(&mut g, &mut vt, "\x1b[0q");
         assert_eq!(g.modes.cursor_shape, Some((CursorStyle::Bar, false)));
+    }
+
+    #[test]
+    fn clusters_underlines_links_prompts_and_notifications() {
+        let mut g = Grid::new(20, 3, 100);
+        let mut vt = Vt::new();
+        // e + combining acute, a ZWJ family, a flag.
+        feed(&mut g, &mut vt, "e\u{301}👨\u{200d}👩x🇳🇱y");
+        assert_eq!(
+            crate::grid::cluster_text(g.cell(0, 0).c).unwrap(),
+            "e\u{301}"
+        );
+        assert_eq!(
+            crate::grid::cluster_text(g.cell(1, 0).c).unwrap(),
+            "👨\u{200d}👩"
+        );
+        assert_eq!(g.cell(3, 0).c, 'x');
+        assert_eq!(crate::grid::cluster_text(g.cell(4, 0).c).unwrap(), "🇳🇱");
+        // Underline styles and color.
+        feed(
+            &mut g,
+            &mut vt,
+            "\r\n\x1b[4:3;58:2::255:0:0ma\x1b[21mb\x1b[24;59mc",
+        );
+        let a = g.cell(0, 1);
+        assert!(a.attr.has(Attr::UNDERLINE | Attr::CURLY_UNDERLINE));
+        assert_eq!(a.ul, Color::Rgb(255, 0, 0));
+        assert!(g.cell(1, 1).attr.has(Attr::DOUBLE_UNDERLINE));
+        assert!(!g.cell(2, 1).attr.has(Attr::UNDERLINE));
+        assert_eq!(g.cell(2, 1).ul, Color::Default);
+        // A hyperlink survives SGR 0 and ends with an empty URI.
+        feed(
+            &mut g,
+            &mut vt,
+            "\x1b]8;;https://x.y\x1b\\L\x1b[0mK\x1b]8;;\x1b\\z",
+        );
+        assert_eq!(
+            crate::grid::link_url(g.cell(3, 1).link).unwrap(),
+            "https://x.y"
+        );
+        assert_ne!(g.cell(4, 1).link, 0);
+        assert_eq!(g.cell(5, 1).link, 0);
+        // Prompt marks, notifications and progress.
+        feed(
+            &mut g,
+            &mut vt,
+            "\x1b]133;A\x07\x1b]9;done\x07\x1b]9;4;1;42\x07",
+        );
+        assert_eq!(g.prompt_lines(), vec![1]);
+        assert_eq!(vt.notification.take().unwrap().1, "done");
+        assert_eq!(vt.progress, Some((1, 42)));
+        feed(
+            &mut g,
+            &mut vt,
+            "\x1b]777;notify;Build;ok\x07\x1b]9;9;C:\\x\x07",
+        );
+        assert_eq!(
+            vt.notification.take().unwrap(),
+            ("Build".into(), "ok".into())
+        );
+        assert!(vt.notification.is_none());
     }
 
     #[test]

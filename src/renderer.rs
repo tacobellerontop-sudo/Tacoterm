@@ -144,48 +144,75 @@ impl Fonts {
         buf
     }
 
-    fn rasterize(&mut self, c: char, bold: bool, italic: bool) -> Option<RasterGlyph> {
-        let mut tmp = [0u8; 4];
-        let buf = self.shape(c.encode_utf8(&mut tmp), bold, italic);
+    /// Draw `text` (one character, or a cluster such as a letter with
+    /// accents or an emoji sequence) as one bitmap.
+    fn rasterize(&mut self, text: &str, bold: bool, italic: bool) -> Option<RasterGlyph> {
+        let buf = self.shape(text, bold, italic);
         let run = buf.layout_runs().next()?;
-        let glyph = run.glyphs.first()?;
-        let physical = glyph.physical((0.0, 0.0), 1.0);
-        let image = self
-            .swash
-            .get_image_uncached(&mut self.system, physical.cache_key)?;
-        let (w, h) = (image.placement.width, image.placement.height);
-        if w == 0 || h == 0 {
-            return None;
+        let line_y = run.line_y.round() as i32;
+        // Each glyph's bitmap and where its top-left lands.
+        let mut parts = Vec::new();
+        for glyph in run.glyphs.iter() {
+            let physical = glyph.physical((0.0, 0.0), 1.0);
+            let Some(image) = self
+                .swash
+                .get_image_uncached(&mut self.system, physical.cache_key)
+            else {
+                continue;
+            };
+            let (w, h) = (image.placement.width, image.placement.height);
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let at = (
+                physical.x + image.placement.left,
+                line_y + physical.y - image.placement.top,
+            );
+            parts.push((at, w, h, image));
         }
-        let pixels = (w * h) as usize;
-        let (rgba, is_color) = match image.content {
-            SwashContent::Mask => {
-                let mut rgba = Vec::with_capacity(pixels * 4);
-                for &a in image.data.iter().take(pixels) {
-                    rgba.extend_from_slice(&[255, 255, 255, a]);
+        let x0 = parts.iter().map(|p| p.0 .0).min()?;
+        let y0 = parts.iter().map(|p| p.0 .1).min()?;
+        let x1 = parts.iter().map(|p| p.0 .0 + p.1 as i32).max()?;
+        let y1 = parts.iter().map(|p| p.0 .1 + p.2 as i32).max()?;
+        let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        let is_color = parts
+            .iter()
+            .any(|p| matches!(p.3.content, SwashContent::Color));
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for ((px, py), w, h, image) in &parts {
+            let pixels = (*w * *h) as usize;
+            for k in 0..pixels {
+                let (sx, sy) = ((k as u32 % w) as i32, (k as u32 / w) as i32);
+                let src = match image.content {
+                    SwashContent::Mask => [255, 255, 255, *image.data.get(k)?],
+                    SwashContent::SubpixelMask => {
+                        let p = image.data.get(k * 4..k * 4 + 3)?;
+                        let a = ((p[0] as u16 + p[1] as u16 + p[2] as u16) / 3) as u8;
+                        [255, 255, 255, a]
+                    }
+                    SwashContent::Color => {
+                        let p = image.data.get(k * 4..k * 4 + 4)?;
+                        [p[0], p[1], p[2], p[3]]
+                    }
+                };
+                if src[3] == 0 {
+                    continue;
                 }
-                (rgba, false)
-            }
-            SwashContent::SubpixelMask => {
-                let mut rgba = Vec::with_capacity(pixels * 4);
-                for px in image.data.as_chunks::<4>().0.iter().take(pixels) {
-                    let a = ((px[0] as u16 + px[1] as u16 + px[2] as u16) / 3) as u8;
-                    rgba.extend_from_slice(&[255, 255, 255, a]);
+                let (dx, dy) = ((px + sx - x0) as u32, (py + sy - y0) as u32);
+                let d = ((dy * width + dx) * 4) as usize;
+                // "Over": later glyphs (accents) on top of earlier ones.
+                let a = src[3] as u32;
+                for c in 0..3 {
+                    rgba[d + c] =
+                        ((src[c] as u32 * a + rgba[d + c] as u32 * (255 - a)) / 255) as u8;
                 }
-                (rgba, false)
+                rgba[d + 3] = (a + rgba[d + 3] as u32 * (255 - a) / 255) as u8;
             }
-            SwashContent::Color => (image.data.clone(), true),
-        };
-        if rgba.len() < pixels * 4 {
-            return None;
         }
         Some(RasterGlyph {
-            offset: (
-                physical.x + image.placement.left,
-                (run.line_y.round() as i32) + physical.y - image.placement.top,
-            ),
-            width: w,
-            height: h,
+            offset: (x0, y0),
+            width,
+            height,
             rgba,
             is_color,
         })
@@ -252,7 +279,9 @@ struct AtlasFull;
 // ---- GPU data ----------------------------------------------------------
 
 /// One quad. `kind`: 0 = solid fill, 1 = mask glyph tinted by `color`,
-/// 2 = color glyph (emoji) drawn as-is.
+/// 2 = color glyph (emoji) drawn as-is, 3 = solid fill with corners
+/// rounded by `uv_pos[0]` pixels, 4 = solid fill outside the circle at
+/// `uv_pos` (in the quad) of radius `uv_size[0]`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Instance {
@@ -277,6 +306,32 @@ impl Instance {
     }
 }
 
+/// A filled rectangle with corners of radius `r`.
+fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32, color: [f32; 4]) -> Instance {
+    Instance {
+        pos: [x, y],
+        size: [w, h],
+        uv_pos: [r, 0.0],
+        uv_size: [0.0; 2],
+        color,
+        kind: 3,
+    }
+}
+
+/// The outside of a rounded corner of radius `r` whose square is at
+/// (x, y); `(cx, cy)` is the circle's centre in the square: (r, r) for a
+/// top-left corner, (0, r) for a top-right one.
+fn fillet(x: f32, y: f32, r: f32, (cx, cy): (f32, f32), color: [f32; 4]) -> Instance {
+    Instance {
+        pos: [x, y],
+        size: [r, r],
+        uv_pos: [cx, cy],
+        uv_size: [r, 0.0],
+        color,
+        kind: 4,
+    }
+}
+
 fn rect(r: Rect, color: [f32; 4]) -> Instance {
     Instance::rect(r.x, r.y, r.w, r.h, color)
 }
@@ -298,6 +353,8 @@ struct ImageDraw {
     image: Arc<Image>,
     quad: Instance,
     clip: Rect,
+    /// Drawn under everything else: the background picture.
+    under: bool,
 }
 
 /// A picture uploaded to the GPU.
@@ -309,6 +366,9 @@ struct GpuImage {
     /// The frame it was last drawn in.
     used: u64,
 }
+
+/// Commands the palette shows at once.
+const PALETTE_ROWS: usize = 12;
 
 const SHADER: &str = r#"
 struct Uniforms {
@@ -325,6 +385,12 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) kind: u32,
+    /// Pixel position inside the quad, for rounded corners.
+    @location(3) local: vec2<f32>,
+    /// The quad's size.
+    @location(4) @interpolate(flat) size: vec2<f32>,
+    /// uv_pos and uv_size as given, which shapes use for their own ends.
+    @location(5) @interpolate(flat) extra: vec4<f32>,
 };
 
 @vertex
@@ -344,6 +410,9 @@ fn vs_main(
     out.uv = (uv_pos + corner * uv_size) / u.atlas;
     out.color = color;
     out.kind = kind;
+    out.local = corner * size;
+    out.size = size;
+    out.extra = vec4<f32>(uv_pos, uv_size);
     return out;
 }
 
@@ -355,6 +424,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if (in.kind == 1u) {
         return vec4<f32>(in.color.rgb, in.color.a * t.a);
+    }
+    if (in.kind == 3u) {
+        // A rounded rectangle: signed distance to its edge, antialiased
+        // over one pixel.
+        let half = in.size * 0.5;
+        let r = min(in.extra.x, min(half.x, half.y));
+        let q = abs(in.local - half) - half + vec2<f32>(r);
+        let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        return vec4<f32>(in.color.rgb, in.color.a * clamp(0.5 - d, 0.0, 1.0));
+    }
+    if (in.kind == 4u) {
+        // Everything outside a circle (centre extra.xy, radius extra.z):
+        // the fill around a rounded corner.
+        let d = length(in.local - in.extra.xy) - in.extra.z;
+        return vec4<f32>(in.color.rgb, in.color.a * clamp(d + 0.5, 0.0, 1.0));
     }
     return t;
 }
@@ -438,6 +522,26 @@ pub struct PaneView<'a> {
     pub current_match: Option<usize>,
     /// A link under the mouse to underline (inclusive).
     pub link: Option<(Point, Point)>,
+    /// Quick-select targets with their labels.
+    pub hints: &'a [Hint],
+}
+
+/// A quick-select target: a span of history and the keys that pick it.
+#[derive(Clone, Debug)]
+pub struct Hint {
+    pub start: Point,
+    pub end: Point,
+    pub label: String,
+}
+
+/// The command palette: a filter box over a list of commands.
+pub struct PaletteView<'a> {
+    /// Shown in the box before anything is typed.
+    pub placeholder: &'a str,
+    pub query: &'a str,
+    /// (label, key or detail shown on the right)
+    pub items: Vec<(&'a str, &'a str)>,
+    pub selected: usize,
 }
 
 /// The find box, drawn in the focused pane.
@@ -461,6 +565,8 @@ pub struct Frame<'a> {
     pub flash: bool,
     /// The settings page, drawn instead of the panes.
     pub settings: Option<SettingsPage<'a>>,
+    /// The command palette, over everything.
+    pub palette: Option<PaletteView<'a>>,
 }
 
 /// How a settings row is edited.
@@ -536,6 +642,7 @@ impl<'a> Frame<'a> {
                 matches: &[],
                 current_match: None,
                 link: None,
+                hints: &[],
             }],
             dividers: Vec::new(),
             tabs: Vec::new(),
@@ -544,6 +651,7 @@ impl<'a> Frame<'a> {
             cursor_on: true,
             flash: false,
             settings: None,
+            palette: None,
         }
     }
 }
@@ -630,6 +738,22 @@ pub struct Renderer {
     image_sampler: wgpu::Sampler,
     images: HashMap<u64, GpuImage>,
     frame_count: u64,
+    /// The config's background picture, its alpha already faded.
+    backdrop: Option<Arc<Image>>,
+}
+
+/// The config's `background_image`, faded to `background_image_opacity`,
+/// if it is set and loads.
+fn load_backdrop(config: &Config) -> Option<Arc<Image>> {
+    let path = config.background_image_path()?;
+    let picture = image::open(path).ok()?.into_rgba8();
+    let (w, h) = picture.dimensions();
+    let fade = config.background_image_opacity.clamp(0.0, 1.0);
+    let mut rgba = picture.into_raw();
+    for a in rgba.iter_mut().skip(3).step_by(4) {
+        *a = (*a as f32 * fade).round() as u8;
+    }
+    Some(Image::new(w, h, rgba))
 }
 
 impl Renderer {
@@ -957,6 +1081,7 @@ impl Renderer {
             image_sampler,
             images: HashMap::new(),
             frame_count: 0,
+            backdrop: load_backdrop(config),
         }
     }
 
@@ -1009,6 +1134,11 @@ impl Renderer {
         self.cursor_style = config.cursor_style();
         self.set_opacity(config.opacity);
         let old = &self.font_config;
+        if old.background_image != config.background_image
+            || old.background_image_opacity != config.background_image_opacity
+        {
+            self.backdrop = load_backdrop(config);
+        }
         let fonts_changed = old.font_family != config.font_family
             || old.font_size != config.font_size
             || old.line_height != config.line_height
@@ -1053,6 +1183,11 @@ impl Renderer {
     }
 
     /// Space between split panes, in pixels.
+    /// Physical pixels per logical pixel.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
     pub fn divider_width(&self) -> u32 {
         (2.0 * self.scale).round().max(1.0) as u32
     }
@@ -1252,7 +1387,8 @@ impl Renderer {
                 is_color: false,
             })
         } else {
-            self.fonts.rasterize(key.c, key.bold, key.italic)
+            let text = crate::grid::cluster_text(key.c).unwrap_or_else(|| key.c.to_string());
+            self.fonts.rasterize(&text, key.bold, key.italic)
         };
         let Some(raster) = raster else {
             self.glyphs.insert(key, None);
@@ -1371,6 +1507,32 @@ impl Renderer {
         frame: &Frame,
     ) -> Result<(Vec<Instance>, usize, Vec<ImageDraw>), AtlasFull> {
         let mut layers = Layers::default();
+        if let (Some(picture), None) = (&self.backdrop, &frame.settings) {
+            // Cover the area below the tab strip, cropping the picture's
+            // overflow evenly.
+            let top = if frame.tabs.is_empty() {
+                0.0
+            } else {
+                self.tab_bar_height() as f32
+            };
+            let area = Rect::new(0.0, top, self.width as f32, self.height as f32 - top);
+            let (iw, ih) = (picture.width as f32, picture.height as f32);
+            let k = (area.w / iw).max(area.h / ih);
+            let (sw, sh) = (area.w / k, area.h / k);
+            layers.images.push(ImageDraw {
+                image: picture.clone(),
+                quad: Instance {
+                    pos: [area.x, area.y],
+                    size: [area.w, area.h],
+                    uv_pos: [(iw - sw) / 2.0, (ih - sh) / 2.0],
+                    uv_size: [sw, sh],
+                    color: [1.0; 4],
+                    kind: 2,
+                },
+                clip: area,
+                under: true,
+            });
+        }
         if let Some(page) = &frame.settings {
             self.build_settings(&mut layers, page, frame.cursor_on)?;
         }
@@ -1392,6 +1554,9 @@ impl Renderer {
         if let (Some(search), Some(pane)) = (&frame.search, frame.panes.iter().find(|p| p.focused))
         {
             self.build_search_bar(&mut layers, search, pane.rect)?;
+        }
+        if let Some(palette) = &frame.palette {
+            self.build_palette(&mut layers, palette)?;
         }
         if frame.flash {
             let flash = self.color(self.colors.foreground, 0.12);
@@ -1439,6 +1604,13 @@ impl Renderer {
             .collect();
         let match_bg = mix(self.colors.background, self.colors.palette[3], 0.45);
         let current_bg = self.colors.palette[11];
+        let hints: Vec<&Hint> = pane
+            .hints
+            .iter()
+            .filter(|h| h.end.line >= top && h.start.line < bottom)
+            .collect();
+        let quick = !pane.hints.is_empty();
+        let hint_bg = mix(self.colors.background, self.colors.palette[4], 0.4);
 
         for (p, y) in grid.visible_images() {
             let [sx, sy, sw, sh] = p.src;
@@ -1468,6 +1640,7 @@ impl Renderer {
                     w: grid.cols as f32 * cw,
                     h: grid.rows as f32 * ch,
                 },
+                under: false,
             });
         }
 
@@ -1495,6 +1668,10 @@ impl Renderer {
                     } else {
                         bg = match_bg;
                     }
+                }
+                let in_hint = quick && hints.iter().any(|h| p >= h.start && p <= h.end);
+                if in_hint {
+                    bg = hint_bg;
                 }
                 if grid.is_selected(x, y) {
                     bg = self.colors.selection;
@@ -1532,7 +1709,14 @@ impl Renderer {
                         }
                     }
                 }
-                let alpha = if cell.attr.has(Attr::DIM) { 0.6 } else { 1.0 };
+                // Quick select fades everything but its targets.
+                let alpha = if quick && !in_hint {
+                    0.4
+                } else if cell.attr.has(Attr::DIM) {
+                    0.6
+                } else {
+                    1.0
+                };
                 let fg_color = self.color(fg, alpha);
                 if cell.c != ' ' && !cell.attr.has(Attr::HIDDEN) {
                     let key = GlyphKey {
@@ -1548,11 +1732,28 @@ impl Renderer {
                     }
                 }
                 let in_link = pane.link.is_some_and(|(a, b)| p >= a && p <= b);
-                if cell.attr.has(Attr::UNDERLINE) || in_link {
-                    let uy = (py + self.fonts.baseline + line_px).min(py + ch - line_px);
+                let uy = (py + self.fonts.baseline + line_px).min(py + ch - line_px);
+                let ul_color = match cell.ul {
+                    Color::Default => fg_color,
+                    c => self.color(self.colors.resolve(c, true, false), alpha),
+                };
+                let w = cw * span;
+                if in_link {
                     layers
                         .decorations
-                        .push(Instance::rect(px, uy, cw * span, line_px, fg_color));
+                        .push(Instance::rect(px, uy, w, line_px, fg_color));
+                } else if cell.attr.has(Attr::UNDERLINE) {
+                    self.underline(layers, cell.attr, (px, uy, w), ch - (uy - py), ul_color);
+                } else if cell.link != 0 {
+                    // An OSC 8 link: a faint dashed line until hovered.
+                    let faint = self.color(fg, alpha * 0.5);
+                    self.underline(
+                        layers,
+                        Attr(Attr::DASHED_UNDERLINE),
+                        (px, uy, w),
+                        0.0,
+                        faint,
+                    );
                 }
                 if cell.attr.has(Attr::STRIKE) {
                     let sy = py + (self.fonts.baseline * 0.65).round();
@@ -1562,6 +1763,25 @@ impl Renderer {
                 }
             }
         }
+
+        // Quick-select labels over the start of each target.
+        let label_bg = self.color(self.colors.palette[11], 1.0);
+        let label_fg = self.color((16, 16, 16), 1.0);
+        let radius = (3.0 * self.scale as f32).round();
+        let mut label_glyphs = Vec::new();
+        for h in &hints {
+            let Some(vy) = h.start.line.checked_sub(top) else {
+                continue;
+            };
+            let lx = ox + h.start.col as f32 * cw;
+            let ly = oy + vy as f32 * ch;
+            let lw = h.label.chars().count() as f32 * cw;
+            layers
+                .overlays
+                .push(rounded(lx - 2.0, ly, lw + 4.0, ch, radius, label_bg));
+            self.text(&mut label_glyphs, (lx, ly), &h.label, label_fg, lw + 1.0)?;
+        }
+        layers.overlays.append(&mut label_glyphs);
 
         // A scroll thumb while looking back through history.
         if grid.display_offset > 0 {
@@ -1578,6 +1798,61 @@ impl Renderer {
         Ok(())
     }
 
+    /// An underline in `attr`'s style across `w` pixels at (x, y); `room`
+    /// is the space left below y in the cell.
+    fn underline(
+        &self,
+        layers: &mut Layers,
+        attr: Attr,
+        (x, y, w): (f32, f32, f32),
+        room: f32,
+        color: [f32; 4],
+    ) {
+        let t = self.line_px();
+        let d = &mut layers.decorations;
+        if attr.has(Attr::DOUBLE_UNDERLINE) {
+            // Two lines a line apart; nudged up if the cell runs out.
+            let y = (y - (3.0 * t - room).max(0.0)).round();
+            d.push(Instance::rect(x, y, w, t, color));
+            d.push(Instance::rect(x, y + 2.0 * t, w, t, color));
+        } else if attr.has(Attr::CURLY_UNDERLINE) {
+            // A wave a few pixels tall, one column at a time, phased by x
+            // so it runs on across cells.
+            let amp = (t * 1.5).max(1.5);
+            let period = (self.fonts.cell_width as f32).max(4.0);
+            let base = y - amp / 2.0;
+            let mut cx = x;
+            while cx < x + w {
+                let phase = (cx / period) * std::f32::consts::TAU;
+                let cy = base + amp * (0.5 - 0.5 * phase.sin());
+                d.push(Instance::rect(cx, cy.round(), 1.0, t, color));
+                cx += 1.0;
+            }
+        } else if attr.has(Attr::DOTTED_UNDERLINE) {
+            let step = t * 2.0;
+            let mut cx = (x / step).ceil() * step;
+            while cx < x + w {
+                d.push(Instance::rect(cx, y, t, t, color));
+                cx += step;
+            }
+        } else if attr.has(Attr::DASHED_UNDERLINE) {
+            let dash = (self.fonts.cell_width as f32 / 2.0).round().max(2.0);
+            let mut cx = x;
+            while cx < x + w {
+                d.push(Instance::rect(
+                    cx,
+                    y,
+                    (dash * 0.6).round().min(x + w - cx),
+                    t,
+                    color,
+                ));
+                cx += dash;
+            }
+        } else {
+            d.push(Instance::rect(x, y, w, t, color));
+        }
+    }
+
     fn build_tab_bar(&mut self, layers: &mut Layers, frame: &Frame) -> Result<(), AtlasFull> {
         let alpha = self.see_through();
         let bg = self.colors.background;
@@ -1589,91 +1864,122 @@ impl Renderer {
         let strip = self.strip(frame.tabs.len());
         let h = self.tab_bar_height() as f32;
         let (_, ch) = self.cell_size();
-        let text_y = ((h - ch as f32) / 2.0).round();
         let cw = self.fonts.cell_width as f32;
-        // The strip, minus the active tab, which shows the pane background
-        // so it reads as attached to the terminal below. With the settings
-        // page up no tab is "attached".
+        let scale = self.scale as f32;
+        // Tabs are cards that start a little below the top of the strip.
+        let top = (5.0 * scale).round();
+        let inset = (3.0 * scale).round();
+        let radius = (7.0 * scale).round().min(h / 3.0);
+        let text_y = ((top + h - ch as f32) / 2.0).round();
+        // The active tab shows the pane background so it reads as part of
+        // the terminal below. With the settings page up no tab is.
         let active = if frame.settings.is_some() {
             None
         } else {
             strip.tabs.get(frame.active_tab).map(|t| t.0)
         };
         let bar_color = self.color(bar, alpha);
-        let full = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: self.width as f32,
-            h,
-        };
+        let b = &mut layers.backgrounds;
+        let full_w = self.width as f32;
         match active {
             Some(a) => {
-                layers
-                    .backgrounds
-                    .push(Instance::rect(0.0, 0.0, a.x, h, bar_color));
-                let right = a.x + a.w;
-                layers.backgrounds.push(Instance::rect(
-                    right,
-                    0.0,
-                    self.width as f32 - right,
-                    h,
+                // The strip around the card, with its top corners rounded.
+                let (ax, aw) = (a.x + inset, a.w - 2.0 * inset);
+                b.push(Instance::rect(0.0, 0.0, full_w, top, bar_color));
+                b.push(Instance::rect(0.0, top, ax, h - top, bar_color));
+                b.push(Instance::rect(
+                    ax + aw,
+                    top,
+                    full_w - ax - aw,
+                    h - top,
+                    bar_color,
+                ));
+                b.push(fillet(ax, top, radius, (radius, radius), bar_color));
+                b.push(fillet(
+                    ax + aw - radius,
+                    top,
+                    radius,
+                    (0.0, radius),
                     bar_color,
                 ));
             }
-            None => layers.backgrounds.push(rect(full, bar_color)),
+            None => b.push(Instance::rect(0.0, 0.0, full_w, h, bar_color)),
         }
         let fg = self.colors.foreground;
         let dim = mix(fg, bar, 0.45);
-        let accent = self.color(self.colors.palette[4], 1.0);
-        let hover_bg = self.color(fg, 0.1);
+        let hover_bg = self.color(fg, 0.08);
         let hover = self.hover;
+        // Each tab gets a colored dot, so tabs are easy to tell apart.
+        const DOTS: [usize; 6] = [12, 13, 14, 10, 11, 9];
+        let dot = (ch as f32 * 0.4).round().max(4.0);
         for (i, (title, (tab, close))) in frame.tabs.iter().zip(&strip.tabs).enumerate() {
             let is_active = Some(*tab) == active;
             let color = self.color(if is_active { fg } else { dim }, 1.0);
-            if is_active {
-                let line = (2.0 * self.scale as f32).round();
-                layers
-                    .decorations
-                    .push(Instance::rect(tab.x, 0.0, tab.w, line, accent));
-            } else {
+            let card = Rect::new(tab.x + inset, top, tab.w - 2.0 * inset, h - top - inset);
+            if !is_active {
                 if hover == Some(TabHit::Tab(i)) || hover == Some(TabHit::Close(i)) {
-                    layers.backgrounds.push(rect(*tab, hover_bg));
-                }
-                if i + 1 != frame.active_tab && i + 1 < strip.tabs.len() {
+                    layers
+                        .backgrounds
+                        .push(rounded(card.x, card.y, card.w, card.h, radius, hover_bg));
+                } else if i + 1 != frame.active_tab && i + 1 < strip.tabs.len() {
                     // Separator between two inactive tabs.
-                    let sep = self.color(dim, 0.5);
+                    let sep = self.color(dim, 0.4);
                     layers.decorations.push(Instance::rect(
                         tab.x + tab.w - 1.0,
-                        h * 0.25,
+                        top + (h - top) * 0.25,
                         1.0,
-                        h * 0.5,
+                        (h - top) * 0.45,
                         sep,
                     ));
                 }
             }
-            let max_w = close.x - tab.x - cw * 1.5;
-            self.text(
-                &mut layers.glyphs,
-                (tab.x + cw, text_y),
-                title,
-                color,
-                max_w,
-            )?;
+            let dot_rgb = self.colors.palette[DOTS[i % DOTS.len()]];
+            let dot_color = self.color(dot_rgb, if is_active { 1.0 } else { 0.55 });
+            let dot_x = (tab.x + inset + cw).round();
+            let dot_y = ((top + h - dot) / 2.0).round();
+            layers
+                .decorations
+                .push(rounded(dot_x, dot_y, dot, dot, dot / 2.0, dot_color));
+            let text_x = dot_x + dot + (cw * 0.8).round();
+            let max_w = close.x - text_x - cw * 0.5;
+            self.text(&mut layers.glyphs, (text_x, text_y), title, color, max_w)?;
             if strip.tabs.len() > 1 {
                 if hover == Some(TabHit::Close(i)) {
-                    layers.backgrounds.push(rect(*close, hover_bg));
+                    layers.backgrounds.push(rounded(
+                        close.x,
+                        close.y + top / 2.0,
+                        close.w,
+                        close.h,
+                        close.w / 2.0,
+                        self.color(fg, 0.15),
+                    ));
                 }
-                self.cross(layers, *close, (close.w * 0.5).round(), color);
+                let mut c = *close;
+                c.y += top / 2.0;
+                // Inactive tabs show their × only on hover, like browsers.
+                if is_active || hover == Some(TabHit::Tab(i)) || hover == Some(TabHit::Close(i)) {
+                    self.cross(layers, c, (close.w * 0.45).round(), color);
+                }
             }
         }
         let c = self.color(dim, 1.0);
-        let t = self.line_px().max(1.0) + (self.scale as f32 - 1.0).max(0.0);
+        let t = self.line_px().max(1.0) + (scale - 1.0).max(0.0);
         // "+" for a new tab.
+        let n = strip.new;
+        let new_y = top / 2.0;
         if hover == Some(TabHit::New) {
-            layers.backgrounds.push(rect(strip.new, hover_bg));
+            let pad = (h - top) * 0.15;
+            layers.backgrounds.push(rounded(
+                n.x + pad,
+                top + pad - inset / 2.0,
+                n.w - 2.0 * pad,
+                h - top - 2.0 * pad,
+                radius,
+                hover_bg,
+            ));
         }
         let arm = (h * 0.3).round();
-        let (cx, cy) = (strip.new.x + strip.new.w / 2.0, h / 2.0);
+        let (cx, cy) = (n.x + n.w / 2.0, h / 2.0 + new_y - inset / 2.0);
         layers.decorations.push(Instance::rect(
             (cx - arm / 2.0).round(),
             (cy - t / 2.0).round(),
@@ -1691,12 +1997,23 @@ impl Renderer {
         // Settings gear.
         let s = strip.settings;
         if hover == Some(TabHit::Settings) || frame.settings.is_some() {
-            layers.backgrounds.push(rect(s, hover_bg));
+            let pad = (h - top) * 0.15;
+            layers.backgrounds.push(rounded(
+                s.x + pad,
+                top + pad - inset / 2.0,
+                s.w - 2.0 * pad,
+                h - top - 2.0 * pad,
+                radius,
+                hover_bg,
+            ));
         }
         let gear_color = self.color(if frame.settings.is_some() { fg } else { dim }, 1.0);
         self.text(
             &mut layers.glyphs,
-            ((s.x + (s.w - cw) / 2.0).round(), text_y),
+            (
+                (s.x + (s.w - cw) / 2.0).round(),
+                text_y - (inset / 2.0).round(),
+            ),
             "⚙",
             gear_color,
             cw * 2.0,
@@ -2022,22 +2339,32 @@ impl Renderer {
             60.0 * cw,
         )?;
 
+        let rr = (5.0 * self.scale as f32).round();
         for (i, row, prev, value, next) in &l.rows {
             let r = &page.rows[*i];
             let selected = *i == page.selected;
             if selected {
-                layers
-                    .backgrounds
-                    .push(rect(*row, self.color(self.colors.selection, 0.55)));
-                layers.decorations.push(Instance::rect(
+                layers.backgrounds.push(rounded(
                     row.x,
                     row.y,
-                    (line * 2.0).max(2.0),
+                    row.w,
                     row.h,
+                    rr,
+                    self.color(self.colors.selection, 0.55),
+                ));
+                let bar = (line * 3.0).max(3.0);
+                layers.decorations.push(rounded(
+                    row.x + bar,
+                    row.y + row.h * 0.25,
+                    bar,
+                    row.h * 0.5,
+                    bar / 2.0,
                     accent,
                 ));
             } else if page.hover.is_some_and(|h| hit_row(h) == Some(*i)) {
-                layers.backgrounds.push(rect(*row, faint));
+                layers
+                    .backgrounds
+                    .push(rounded(row.x, row.y, row.w, row.h, rr, faint));
             }
             let ty = text_dy(*row);
             self.text(
@@ -2055,7 +2382,9 @@ impl Renderer {
                         w: next.x + next.w - prev.x,
                         h: row.h * 0.7,
                     };
-                    layers.backgrounds.push(rect(pill, faint));
+                    layers
+                        .backgrounds
+                        .push(rounded(pill.x, pill.y, pill.w, pill.h, rr, faint));
                     let arrow = |h: SettingsHit| {
                         if page.hover == Some(h) {
                             fg_c
@@ -2085,23 +2414,30 @@ impl Renderer {
                     let track = self.slider_track(*prev, *value, *next);
                     let th = (line * 2.0).max(2.0);
                     let ty_track = (track.y - th / 2.0).round();
-                    layers.backgrounds.push(Instance::rect(
+                    layers.backgrounds.push(rounded(
                         track.x,
                         ty_track,
                         track.w,
                         th,
+                        th / 2.0,
                         self.color(fg, 0.2),
                     ));
                     let filled = (track.w * t).round();
-                    layers
-                        .backgrounds
-                        .push(Instance::rect(track.x, ty_track, filled, th, accent));
+                    layers.backgrounds.push(rounded(
+                        track.x,
+                        ty_track,
+                        filled,
+                        th,
+                        th / 2.0,
+                        accent,
+                    ));
                     let knob = (ch * 0.7).round();
-                    layers.decorations.push(Instance::rect(
+                    layers.decorations.push(rounded(
                         (track.x + filled - knob / 2.0).round(),
                         (track.y - knob / 2.0).round(),
                         knob,
                         knob,
+                        knob / 2.0,
                         fg_c,
                     ));
                     self.text(
@@ -2122,7 +2458,7 @@ impl Renderer {
                     let by = (row.y + (row.h - bh) / 2.0).round();
                     layers
                         .backgrounds
-                        .push(Instance::rect(x0, by, x1 - x0, bh, faint));
+                        .push(rounded(x0, by, x1 - x0, bh, rr, faint));
                     // An underline marks it as a box to type in.
                     layers.decorations.push(Instance::rect(
                         x0,
@@ -2185,7 +2521,7 @@ impl Renderer {
                     let track = if on { accent } else { self.color(fg, 0.25) };
                     layers
                         .backgrounds
-                        .push(Instance::rect(px, py, pw, ph, track));
+                        .push(rounded(px, py, pw, ph, ph / 2.0, track));
                     let k = ph - 2.0 * line.max(2.0);
                     let kx = if on {
                         px + pw - k - line.max(2.0)
@@ -2194,7 +2530,7 @@ impl Renderer {
                     };
                     layers
                         .decorations
-                        .push(Instance::rect(kx, py + line.max(2.0), k, k, fg_c));
+                        .push(rounded(kx, py + line.max(2.0), k, k, k / 2.0, fg_c));
                     self.text(
                         &mut layers.glyphs,
                         (px + pw + cw, ty),
@@ -2237,7 +2573,14 @@ impl Renderer {
                 (false, true) => self.color(fg, 0.14),
                 (false, false) => faint,
             };
-            layers.backgrounds.push(rect(r, fill));
+            layers.backgrounds.push(rounded(
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                (6.0 * self.scale as f32).round(),
+                fill,
+            ));
             let text = if primary { self.color(bg, 1.0) } else { fg_c };
             let cols = label.chars().count() as f32;
             self.text(
@@ -2271,8 +2614,169 @@ impl Renderer {
             matches: &[],
             current_match: None,
             link: None,
+            hints: &[],
         };
         self.build_pane(layers, &view, cursor_on)
+    }
+
+    /// The command palette: a floating card near the top with a filter box
+    /// and the matching commands, the selected one lit.
+    fn build_palette(&mut self, layers: &mut Layers, view: &PaletteView) -> Result<(), AtlasFull> {
+        let (cw, ch) = self.cell_size();
+        let (cw, ch) = (cw as f32, ch as f32);
+        let scale = self.scale as f32;
+        let full = self.full_rect();
+        // Fade what's behind so the card stands out.
+        let shade = self.color((0, 0, 0), 0.3);
+        layers.overlays.push(rect(full, shade));
+
+        let row_h = (ch * 1.5).round();
+        let pad = (cw * 1.2).round();
+        let shown = view.items.len().min(PALETTE_ROWS);
+        let w = (64.0 * cw).min(full.w - 4.0 * cw).max(20.0 * cw);
+        let h = row_h * (shown as f32 + 1.0) + pad * 1.5 + if shown == 0 { 0.0 } else { pad * 0.5 };
+        let x = ((full.w - w) / 2.0).round();
+        let y = (self.tab_bar_height() as f32 + 2.0 * ch)
+            .min(full.h / 4.0)
+            .round();
+        let bg = self.colors.background;
+        let card = if luma(bg) < 128.0 {
+            mix(bg, (255, 255, 255), 0.08)
+        } else {
+            mix(bg, (255, 255, 255), 0.6)
+        };
+        let accent = self.colors.palette[12];
+        let radius = (10.0 * scale).round();
+        let o = &mut layers.overlays;
+        // A soft shadow: a few widening, fading rounded rects.
+        for i in (1..=4).rev() {
+            let g = i as f32 * 3.0 * scale;
+            o.push(rounded(
+                x - g,
+                y - g + 4.0 * scale,
+                w + 2.0 * g,
+                h + 2.0 * g,
+                radius + g,
+                self.color((0, 0, 0), 0.07),
+            ));
+        }
+        let border = mix(card, self.colors.foreground, 0.15);
+        let line = self.line_px();
+        o.push(rounded(
+            x - line,
+            y - line,
+            w + 2.0 * line,
+            h + 2.0 * line,
+            radius + line,
+            self.color(border, 1.0),
+        ));
+        o.push(rounded(x, y, w, h, radius, self.color(card, 1.0)));
+
+        // The filter box.
+        let fg = self.color(self.colors.foreground, 1.0);
+        let dim_rgb = mix(self.colors.foreground, card, 0.45);
+        let dim = self.color(dim_rgb, 1.0);
+        let field = mix(card, bg, 0.6);
+        let (fx, fy, fw) = (x + pad * 0.5, y + pad * 0.5, w - pad);
+        o.push(rounded(
+            fx,
+            fy,
+            fw,
+            row_h,
+            (6.0 * scale).round(),
+            self.color(field, 1.0),
+        ));
+        let ty = |row_y: f32| (row_y + (row_h - ch) / 2.0).round();
+        let mut glyphs = Vec::new();
+        let tx = fx + pad * 0.5;
+        let used = self.text(&mut glyphs, (tx, ty(fy)), "› ", self.color(accent, 1.0), fw)?;
+        if view.query.is_empty() {
+            self.text(
+                &mut glyphs,
+                (tx + used, ty(fy)),
+                view.placeholder,
+                dim,
+                fw - used - pad,
+            )?;
+            glyphs.push(Instance::rect(
+                tx + used,
+                ty(fy),
+                (line * 2.0).max(2.0),
+                ch,
+                fg,
+            ));
+        } else {
+            let qw = self.text(
+                &mut glyphs,
+                (tx + used, ty(fy)),
+                view.query,
+                fg,
+                fw - used - pad,
+            )?;
+            glyphs.push(Instance::rect(
+                tx + used + qw,
+                ty(fy),
+                (line * 2.0).max(2.0),
+                ch,
+                fg,
+            ));
+        }
+
+        // The list, scrolled so the selection stays in view.
+        let first = view.selected.saturating_sub(shown.saturating_sub(1));
+        let list_y = fy + row_h + pad * 0.5;
+        if view.items.is_empty() {
+            self.text(
+                &mut glyphs,
+                (tx, ty(list_y)),
+                "No matching commands",
+                dim,
+                fw,
+            )?;
+        }
+        for (k, (label, hint)) in view.items.iter().enumerate().skip(first).take(shown) {
+            let ry = list_y + (k - first) as f32 * row_h;
+            let selected = k == view.selected;
+            if selected {
+                let lit = mix(card, accent, 0.35);
+                layers.overlays.push(rounded(
+                    fx,
+                    ry,
+                    fw,
+                    row_h,
+                    (6.0 * scale).round(),
+                    self.color(lit, 1.0),
+                ));
+                layers.overlays.push(rounded(
+                    fx,
+                    ry + row_h * 0.2,
+                    3.0 * scale,
+                    row_h * 0.6,
+                    1.5 * scale,
+                    self.color(accent, 1.0),
+                ));
+            }
+            let hint_w = unicode_width::UnicodeWidthStr::width(*hint) as f32 * cw;
+            let label_room = fw - pad * 1.5 - hint_w - cw;
+            self.text(&mut glyphs, (tx, ty(ry)), label, fg, label_room)?;
+            if !hint.is_empty() {
+                let hx = fx + fw - pad * 0.5 - hint_w;
+                self.text(&mut glyphs, (hx, ty(ry)), hint, dim, hint_w + 1.0)?;
+            }
+        }
+        if view.items.len() > shown {
+            let more = format!("{}/{}", view.selected + 1, view.items.len());
+            let mw = more.chars().count() as f32 * cw;
+            self.text(
+                &mut glyphs,
+                (fx + fw - pad * 0.5 - mw, ty(fy)),
+                &more,
+                dim,
+                mw + 1.0,
+            )?;
+        }
+        layers.overlays.append(&mut glyphs);
+        Ok(())
     }
 
     fn build_search_bar(
@@ -2301,14 +2805,27 @@ impl Renderer {
         } else {
             mix(bg, (0, 0, 0), 0.06)
         };
-        let border = self.color(self.colors.palette[4], 1.0);
+        let border = self.color(self.colors.palette[12], 1.0);
         let line = self.line_px();
         let o = &mut layers.overlays;
-        o.push(Instance::rect(x, y, w, h, self.color(box_bg, 1.0)));
-        o.push(Instance::rect(x, y, w, line, border));
-        o.push(Instance::rect(x, y + h - line, w, line, border));
-        o.push(Instance::rect(x, y, line, h, border));
-        o.push(Instance::rect(x + w - line, y, line, h, border));
+        let r = (6.0 * self.scale as f32).round();
+        o.push(rounded(
+            x,
+            y + 2.0 * line,
+            w,
+            h,
+            r,
+            self.color((0, 0, 0), 0.25),
+        ));
+        o.push(rounded(
+            x - line,
+            y - line,
+            w + 2.0 * line,
+            h + 2.0 * line,
+            r + line,
+            border,
+        ));
+        o.push(rounded(x, y, w, h, r, self.color(box_bg, 1.0)));
 
         // Overlay glyphs must land after the overlay boxes.
         let mut glyphs = Vec::new();
@@ -2395,7 +2912,7 @@ impl Renderer {
         let mut drawn = Vec::new();
         for d in &images {
             if self.upload_image(&d.image) {
-                drawn.push((d.image.uid, d.clip));
+                drawn.push((d.image.uid, d.clip, d.under));
                 instances.push(d.quad);
             }
         }
@@ -2454,22 +2971,33 @@ impl Renderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.instances.slice(..));
-                pass.draw(0..4, 0..backgrounds as u32);
-                for (k, (uid, clip)) in drawn.iter().enumerate() {
-                    let Some(gpu) = self.images.get(uid) else {
-                        continue;
-                    };
-                    let Some((x, y, w, h)) = self.scissor(*clip) else {
-                        continue;
-                    };
-                    pass.set_scissor_rect(x, y, w, h);
-                    pass.set_bind_group(0, &gpu.bind_group, &[]);
-                    let i = (main + k) as u32;
-                    pass.draw(0..4, i..i + 1);
-                }
-                if !drawn.is_empty() {
-                    pass.set_scissor_rect(0, 0, self.width, self.height);
-                    pass.set_bind_group(0, &self.bind_group, &[]);
+                // The background picture, then cell backgrounds, then
+                // pictures in the text, then the rest.
+                for layer in [true, false] {
+                    let mut any = false;
+                    for (k, (uid, clip, under)) in drawn.iter().enumerate() {
+                        if *under != layer {
+                            continue;
+                        }
+                        let Some(gpu) = self.images.get(uid) else {
+                            continue;
+                        };
+                        let Some((x, y, w, h)) = self.scissor(*clip) else {
+                            continue;
+                        };
+                        pass.set_scissor_rect(x, y, w, h);
+                        pass.set_bind_group(0, &gpu.bind_group, &[]);
+                        let i = (main + k) as u32;
+                        pass.draw(0..4, i..i + 1);
+                        any = true;
+                    }
+                    if any {
+                        pass.set_scissor_rect(0, 0, self.width, self.height);
+                        pass.set_bind_group(0, &self.bind_group, &[]);
+                    }
+                    if layer {
+                        pass.draw(0..4, 0..backgrounds as u32);
+                    }
                 }
                 pass.draw(0..4, backgrounds as u32..main as u32);
             }
