@@ -23,6 +23,10 @@ pub enum Key {
     CtrlC,
     CtrlD,
     CtrlL,
+    /// Search history
+    CtrlR,
+    /// Cancel a search
+    CtrlG,
     KillStart,
     KillEnd,
     KillWordBack,
@@ -74,10 +78,12 @@ fn decode(b: &[u8]) -> Option<(Key, usize)> {
         0x04 => Key::CtrlD,
         0x05 => Key::End,
         0x06 => Key::Right,
+        0x07 => Key::CtrlG,
         0x0b => Key::KillEnd,
         0x0c => Key::CtrlL,
         0x0e => Key::Down,
         0x10 => Key::Up,
+        0x12 => Key::CtrlR,
         0x15 => Key::KillStart,
         0x17 => Key::KillWordBack,
         c if c < 0x20 => Key::Unknown,
@@ -260,6 +266,14 @@ pub fn visible_width(s: &str) -> usize {
     width
 }
 
+/// How the line looks: the text with colors added (the same width as the
+/// text), and a suggestion shown dimmed after it.
+#[derive(Default)]
+pub struct Look {
+    pub colored: Option<String>,
+    pub ghost: String,
+}
+
 /// Redraw the prompt and line. `cursor_row` is how many rows below the
 /// prompt's first row the cursor is now; returns the output and the new
 /// value.
@@ -267,6 +281,7 @@ pub fn render(
     prompt: &str,
     prompt_width: usize,
     line: &Line,
+    look: &Look,
     cols: usize,
     cursor_row: usize,
 ) -> (String, usize) {
@@ -278,8 +293,11 @@ pub fn render(
     out.push_str("\r\x1b[J");
     out.push_str(prompt);
     let text = line.text();
-    out.push_str(&text);
-    let total = prompt_width + str_width(&text);
+    out.push_str(look.colored.as_deref().unwrap_or(&text));
+    if !look.ghost.is_empty() {
+        out.push_str(&format!("\x1b[90m{}\x1b[0m", look.ghost));
+    }
+    let total = prompt_width + str_width(&text) + str_width(&look.ghost);
     if total > 0 && total.is_multiple_of(cols) {
         // The cursor is parked past the last column; step onto the next row
         // so where it is isn't up to the terminal.
@@ -371,18 +389,77 @@ pub enum ReadLine {
     Eof,
 }
 
-/// Read one line with editing, history and completion.
+/// The newest history entry that starts with `text` (and goes further),
+/// for the suggestion shown after the cursor.
+pub fn suggest<'a>(history: &'a [String], text: &str) -> Option<&'a str> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    history
+        .iter()
+        .rev()
+        .find(|h| h.len() > text.len() && h.starts_with(text) && !h.contains('\n'))
+        .map(|h| &h[text.len()..])
+}
+
+/// The newest entry before `before` containing `query`, ignoring case.
+fn search_back(history: &[String], query: &str, before: usize) -> Option<usize> {
+    let query = query.to_lowercase();
+    history[..before.min(history.len())]
+        .iter()
+        .rposition(|h| h.to_lowercase().contains(&query))
+}
+
+/// Ctrl+R: searching history as you type.
+struct Search {
+    query: String,
+    found: Option<usize>,
+    /// The line from before the search, back on Esc.
+    saved: Line,
+}
+
+/// Read one line with editing, history, suggestions, search, colors and
+/// completion.
 pub fn read_line(
     io: &mut dyn Io,
     prompt: &str,
     history: &[String],
     complete: &dyn Fn(&[char]) -> Completion,
+    highlight: &dyn Fn(&[char]) -> String,
 ) -> std::io::Result<ReadLine> {
     let prompt_width = visible_width(prompt);
     let mut decoder = KeyDecoder::default();
     let mut line = Line::default();
     let mut walk = HistoryWalk::new(history);
-    let (out, mut row) = render(prompt, prompt_width, &line, io.cols(), 0);
+    let mut search: Option<Search> = None;
+    // What to draw: the prompt (or the search's), and how the line looks.
+    let draw = |line: &Line, search: &Option<Search>, ghost: bool, cols: usize, row: usize| {
+        let look = |line: &Line| Look {
+            colored: Some(highlight(&line.chars)),
+            ghost: if ghost && line.cursor == line.chars.len() {
+                suggest(history, &line.text()).unwrap_or("").to_string()
+            } else {
+                String::new()
+            },
+        };
+        match search {
+            None => render(prompt, prompt_width, line, &look(line), cols, row),
+            Some(s) => {
+                let label = if s.found.is_none() && !s.query.is_empty() {
+                    "search, no match"
+                } else {
+                    "search"
+                };
+                let p = format!("\x1b[2m({label})\x1b[0m {}\x1b[2m:\x1b[0m ", s.query);
+                let mut shown = Line::default();
+                if let Some(i) = s.found {
+                    shown.set(&history[i].replace('\n', " "));
+                }
+                render(&p, visible_width(&p), &shown, &look(&shown), cols, row)
+            }
+        }
+    };
+    let (out, mut row) = draw(&line, &search, true, io.cols(), 0);
     io.write(&out)?;
     let mut buf = [0u8; 1024];
     loop {
@@ -392,55 +469,105 @@ pub fn read_line(
         }
         for key in decoder.feed(&buf[..n]) {
             let cols = io.cols();
-            let finish = |line: &Line| {
-                // Put the cursor after the whole line before leaving it.
-                let mut end = line.clone();
-                end.cursor = end.chars.len();
-                render(prompt, prompt_width, &end, cols, row).0
-            };
-            match key {
-                Key::Enter => {
-                    io.write(&(finish(&line) + "\r\n"))?;
-                    return Ok(ReadLine::Line(line.text()));
-                }
-                Key::CtrlC => {
-                    io.write(&(finish(&line) + "^C\r\n"))?;
-                    return Ok(ReadLine::Interrupted);
-                }
-                Key::CtrlD if line.chars.is_empty() => {
-                    io.write(&(finish(&line) + "\r\n"))?;
-                    return Ok(ReadLine::Eof);
-                }
-                Key::CtrlL => {
-                    io.write("\x1b[H\x1b[2J")?;
-                    row = 0;
-                }
-                Key::Up | Key::Down => walk.step(&mut line, key == Key::Up),
-                Key::Tab => {
-                    let before = &line.chars[..line.cursor];
-                    let c = complete(before);
-                    let prefix = common_prefix(&c.candidates);
-                    let typed: String = line.chars[c.start..line.cursor].iter().collect();
-                    if let [only] = c.candidates.as_slice() {
-                        let mut text = only.replace.clone();
-                        if !only.is_dir {
-                            text.push(' ');
+            // Keys typed while searching change the search; anything else
+            // takes the line found and carries on.
+            let key = match search.as_mut() {
+                None => Some(key),
+                Some(s) => match key {
+                    Key::Char(c) => {
+                        s.query.push(c);
+                        s.found = search_back(history, &s.query, history.len());
+                        None
+                    }
+                    Key::Backspace => {
+                        s.query.pop();
+                        s.found = search_back(history, &s.query, history.len());
+                        None
+                    }
+                    Key::CtrlR => {
+                        if let Some(at) = s.found {
+                            s.found = search_back(history, &s.query, at).or(s.found);
                         }
-                        line.replace_back_to(c.start, &text);
-                    } else if prefix.chars().count() > typed.chars().count() {
-                        line.replace_back_to(c.start, &prefix);
-                    } else if !c.candidates.is_empty() {
-                        let names: Vec<String> =
-                            c.candidates.into_iter().map(|c| c.display).collect();
-                        io.write(&(finish(&line) + "\r\n" + &columns(&names, cols)))?;
+                        None
+                    }
+                    Key::CtrlG | Key::Escape | Key::CtrlC => {
+                        line = s.saved.clone();
+                        search = None;
+                        None
+                    }
+                    other => {
+                        if let Some(i) = s.found {
+                            line.set(&history[i]);
+                        }
+                        search = None;
+                        Some(other)
+                    }
+                },
+            };
+            if let Some(key) = key {
+                let finish = |line: &Line| {
+                    // Put the cursor after the whole line before leaving it.
+                    let mut end = line.clone();
+                    end.cursor = end.chars.len();
+                    draw(&end, &None, false, cols, row).0
+                };
+                match key {
+                    Key::Enter => {
+                        io.write(&(finish(&line) + "\r\n"))?;
+                        return Ok(ReadLine::Line(line.text()));
+                    }
+                    Key::CtrlC => {
+                        io.write(&(finish(&line) + "^C\r\n"))?;
+                        return Ok(ReadLine::Interrupted);
+                    }
+                    Key::CtrlD if line.chars.is_empty() => {
+                        io.write(&(finish(&line) + "\r\n"))?;
+                        return Ok(ReadLine::Eof);
+                    }
+                    Key::CtrlL => {
+                        io.write("\x1b[H\x1b[2J")?;
                         row = 0;
                     }
-                }
-                other => {
-                    line.edit(other);
+                    Key::CtrlR => {
+                        search = Some(Search {
+                            query: String::new(),
+                            found: None,
+                            saved: line.clone(),
+                        });
+                    }
+                    Key::Right | Key::End if line.cursor == line.chars.len() => {
+                        // Take the suggestion.
+                        if let Some(rest) = suggest(history, &line.text()) {
+                            line.insert_str(rest);
+                        }
+                    }
+                    Key::Up | Key::Down => walk.step(&mut line, key == Key::Up),
+                    Key::Tab => {
+                        let before = &line.chars[..line.cursor];
+                        let c = complete(before);
+                        let prefix = common_prefix(&c.candidates);
+                        let typed: String = line.chars[c.start..line.cursor].iter().collect();
+                        if let [only] = c.candidates.as_slice() {
+                            let mut text = only.replace.clone();
+                            if !only.is_dir {
+                                text.push(' ');
+                            }
+                            line.replace_back_to(c.start, &text);
+                        } else if prefix.chars().count() > typed.chars().count() {
+                            line.replace_back_to(c.start, &prefix);
+                        } else if !c.candidates.is_empty() {
+                            let names: Vec<String> =
+                                c.candidates.into_iter().map(|c| c.display).collect();
+                            io.write(&(finish(&line) + "\r\n" + &columns(&names, cols)))?;
+                            row = 0;
+                        }
+                    }
+                    other => {
+                        line.edit(other);
+                    }
                 }
             }
-            let (out, r) = render(prompt, prompt_width, &line, cols, row);
+            let (out, r) = draw(&line, &search, true, cols, row);
             row = r;
             io.write(&out)?;
         }
@@ -518,7 +645,7 @@ mod tests {
         let mut l = Line::default();
         l.set("hello");
         l.cursor = 2;
-        let (out, row) = render("> ", 2, &l, 80, 0);
+        let (out, row) = render("> ", 2, &l, &Look::default(), 80, 0);
         assert_eq!(out, "\r\x1b[J> hello\r\x1b[4C");
         assert_eq!(row, 0);
     }
@@ -528,13 +655,13 @@ mod tests {
         let mut l = Line::default();
         l.set("abcdefgh"); // prompt 2 + 8 = 10 cells on 4 columns: 3 rows
         l.cursor = 1; // cell 3: row 0
-        let (out, row) = render("> ", 2, &l, 4, 1);
+        let (out, row) = render("> ", 2, &l, &Look::default(), 4, 1);
         assert!(out.starts_with("\x1b[1A\r\x1b[J"));
         assert!(out.ends_with("\x1b[2A\r\x1b[3C"));
         assert_eq!(row, 0);
         // Ending exactly on the edge moves to the next row.
         l.set("ab");
-        let (out, row) = render("> ", 2, &l, 4, 0);
+        let (out, row) = render("> ", 2, &l, &Look::default(), 4, 0);
         assert!(out.ends_with(" \r\x1b[K\r"));
         assert_eq!(row, 1);
     }
@@ -608,7 +735,7 @@ mod tests {
                     .collect(),
             }
         };
-        read_line(&mut io, "$ ", history, &complete).unwrap()
+        read_line(&mut io, "$ ", history, &complete, &|c| c.iter().collect()).unwrap()
     }
 
     #[test]
@@ -626,6 +753,43 @@ mod tests {
         assert_eq!(
             run(&[b"so\t", b"e\t", b"x\r"], &[]),
             ReadLine::Line("sorted x".into())
+        );
+    }
+
+    #[test]
+    fn suggestions_and_search() {
+        let history = vec![
+            "git status".to_string(),
+            "git push".to_string(),
+            "ls".to_string(),
+        ];
+        assert_eq!(suggest(&history, "git"), Some(" push"));
+        assert_eq!(suggest(&history, "git s"), Some("tatus"));
+        assert_eq!(suggest(&history, "ls"), None);
+        assert_eq!(suggest(&history, ""), None);
+        // Right takes the suggestion.
+        assert_eq!(
+            run(&[b"git s", b"\x1b[C\r"], &history),
+            ReadLine::Line("git status".into())
+        );
+        // Ctrl+R finds the newest match; again goes further back.
+        assert_eq!(
+            run(&[b"\x12git\r"], &history),
+            ReadLine::Line("git push".into())
+        );
+        assert_eq!(
+            run(&[b"\x12git\x12\r"], &history),
+            ReadLine::Line("git status".into())
+        );
+        // A key that isn't for the search takes the match and edits it.
+        assert_eq!(
+            run(&[b"\x12pu\x1b[D\x7f\r"], &history),
+            ReadLine::Line("git puh".into())
+        );
+        // Esc goes back to what was typed.
+        assert_eq!(
+            run(&[b"ab\x12git\x1b", b"c\r"], &history),
+            ReadLine::Line("abc".into())
         );
     }
 }

@@ -63,7 +63,8 @@ mod sys {
 
     unsafe extern "system" fn on_ctrl(_kind: u32) -> BOOL {
         // Handled: the shell stays up, and the program in front (which got
-        // the same Ctrl+C) stops.
+        // the same Ctrl+C) stops. A running loop stops too.
+        crate::shell::INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
         TRUE
     }
 
@@ -106,7 +107,9 @@ mod sys {
         }
     }
 
-    extern "C" fn on_sigint(_: libc::c_int) {}
+    extern "C" fn on_sigint(_: libc::c_int) {
+        crate::shell::INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     pub fn ignore_ctrl_c() {
         // A handler, not SIG_IGN, so programs we start get the default back.

@@ -126,3 +126,58 @@ fn builtins_read_pipes_and_files() {
     assert_eq!(stdout(&o), "apple\nbanana\n1\n1\nx\nf.txt\n");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn wildcards_braces_and_substitution() {
+    let dir = scratch("glob");
+    std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+    for f in ["a.txt", "b.txt", "c.md", "src/x.rs", "src/deep/y.rs"] {
+        std::fs::write(dir.join(f), "").unwrap();
+    }
+    let o = run_in(
+        &dir,
+        "echo *.txt; echo **/*.rs; echo '*.txt' none*; echo f.{a,b{1,2}}; \
+         echo $(echo one; echo two) \"$(seq 2)\"; echo $((6 * 7)) $(( (1 + 2) * $(echo 3) ))",
+    );
+    assert_eq!(
+        stdout(&o).replace('\\', "/"),
+        "a.txt b.txt\nsrc/deep/y.rs src/x.rs\n*.txt none*\nf.a f.b1 f.b2\none two 1\n2\n42 9\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn blocks_and_functions() {
+    let o = run(
+        "function greet\n  echo \"hi $1 ($# args)\"\n  return 3\nend\n\
+         greet bob x; echo status $?\n\
+         for n in 1 2 3 4; if test $n = 2; continue; else if [ $n -eq 4 ]; break; end; echo n$n; end\n\
+         set i=0; while test $i -lt 3; set i=$((i + 1)); end; echo i=$i\n\
+         not false && echo negated\n\
+         function fact; if test $1 -le 1; echo 1; else; echo $(( $1 * $(fact $(( $1 - 1 ))) )); end; end; fact 6\n\
+         greet loud | tr a-z A-Z\n\
+         T=temp \"$TS\" -c 'echo $T'; echo \"after: [$T]\"",
+    );
+    assert_eq!(
+        stdout(&o),
+        "hi bob (2 args)\nstatus 3\nn1\nn3\ni=3\nnegated\n720\nHI LOUD (1 ARGS)\ntemp\nafter: []\n"
+    );
+}
+
+#[test]
+fn scripts_span_lines() {
+    let o = Command::new(TS)
+        .env("TS", TS)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(
+                b"for x in a b\n  echo $x |\n    tr a-z A-Z\nend\necho \"two\nlines\"\n",
+            )?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(stdout(&o), "A\nB\ntwo\nlines\n");
+}
