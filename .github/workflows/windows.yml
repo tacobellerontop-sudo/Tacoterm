@@ -10,10 +10,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
       - name: Build
         run: cargo build --release --locked
+      - name: Bundle the console that passes pictures through
+        run: ./scripts/get-conpty.ps1 -Dest target/release
+      - name: Build the installer
+        run: ./scripts/build-installer.ps1
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: tacoterm-windows-x86_64
-          path: target/release/tacoterm.exe
+          path: |
+            target/release/tacoterm.exe
+            target/release/conpty.dll
+            target/release/OpenConsole.exe
+            target/release/tacoshell.exe
+          if-no-files-found: warn
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: tacoterm-setup
+          path: target/installer/*.exe
+          if-no-files-found: error
