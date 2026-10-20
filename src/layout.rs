@@ -358,6 +358,55 @@ impl Layout {
         changed
     }
 
+    /// The divider at a point, by its index in [`Self::dividers`], with a
+    /// few pixels of slack either side so thin gaps are easy to grab.
+    pub fn divider_at(&self, area: Rect, gap: f32, x: f32, y: f32, slack: f32) -> Option<usize> {
+        self.dividers(area, gap).iter().position(|d| {
+            Rect::new(
+                d.x - slack,
+                d.y - slack,
+                d.w + 2.0 * slack,
+                d.h + 2.0 * slack,
+            )
+            .contains(x, y)
+        })
+    }
+
+    /// Move divider `index` (as numbered by [`Self::dividers`]) so its gap
+    /// starts at `pos`: an x for a [`Split::Right`], a y for a
+    /// [`Split::Down`]. Returns whether anything moved.
+    pub fn drag_divider(&mut self, area: Rect, gap: f32, index: usize, pos: f32) -> bool {
+        fn find(
+            node: &mut Node,
+            area: Rect,
+            gap: f32,
+            index: &mut usize,
+            pos: f32,
+        ) -> Option<bool> {
+            let Node::Split { split, ratio, a, b } = node else {
+                return None;
+            };
+            let (ra, _, rb) = divide(area, *split, *ratio, gap);
+            if *index == 0 {
+                let (start, len) = match split {
+                    Split::Right => (area.x, area.w - gap),
+                    Split::Down => (area.y, area.h - gap),
+                };
+                if len <= 0.0 {
+                    return Some(false);
+                }
+                let new = ((pos - start) / len).clamp(MIN_RATIO, MAX_RATIO);
+                let moved = (new - *ratio).abs() > f32::EPSILON;
+                *ratio = new;
+                return Some(moved);
+            }
+            *index -= 1;
+            find(a, ra, gap, index, pos).or_else(|| find(b, rb, gap, index, pos))
+        }
+        let mut index = index;
+        find(&mut self.root, area, gap, &mut index, pos).unwrap_or(false)
+    }
+
     /// Which pane is at a point, if any (points on a divider hit none).
     pub fn pane_at(&self, area: Rect, gap: f32, x: f32, y: f32) -> Option<PaneId> {
         self.rects(area, gap)
@@ -518,5 +567,21 @@ mod tests {
         assert_eq!(l.pane_at(AREA, 1.0, 80.0, 45.0), Some(3));
         assert_eq!(l.pane_at(AREA, 1.0, 200.0, 10.0), None);
         assert!(AREA.contains(0.0, 0.0) && !AREA.contains(101.0, 0.0));
+    }
+
+    #[test]
+    fn dragging_a_divider_moves_it() {
+        let mut l = Layout::new(1);
+        assert!(l.split(1, Split::Right, 2));
+        assert!(l.split(2, Split::Down, 3));
+        let d = l.dividers(AREA, 1.0);
+        assert_eq!(l.divider_at(AREA, 1.0, d[1].x + 3.0, d[1].y, 2.0), Some(1));
+        assert_eq!(l.divider_at(AREA, 1.0, d[0].x, 5.0, 2.0), Some(0));
+        assert!(l.drag_divider(AREA, 1.0, 0, 25.0));
+        assert_eq!(l.dividers(AREA, 1.0)[0].x, 25.0);
+        // Clamped so no pane vanishes.
+        l.drag_divider(AREA, 1.0, 0, 0.0);
+        assert_eq!(l.dividers(AREA, 1.0)[0].x, 10.0);
+        assert!(!l.drag_divider(AREA, 1.0, 5, 3.0));
     }
 }

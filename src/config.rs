@@ -41,6 +41,11 @@ pub struct Config {
     pub cursor_blink: bool,
     /// How solid the background is, 0.0 (clear) to 1.0 (solid).
     pub opacity: f32,
+    /// A picture behind the text (PNG, JPEG, GIF, BMP or WebP), covering
+    /// the window; empty for none. `~` stands for your user folder.
+    pub background_image: String,
+    /// How strongly the picture shows, 0.0 (not at all) to 1.0 (fully).
+    pub background_image_opacity: f32,
     /// What shows through a see-through background on Windows 11:
     /// `none`, `acrylic` (blurred), `mica` (wallpaper tint) or `tabbed`.
     pub backdrop: String,
@@ -111,6 +116,10 @@ pub struct Keybindings {
     pub fullscreen: String,
     pub next_color_scheme: String,
     pub open_settings: String,
+    pub previous_prompt: String,
+    pub next_prompt: String,
+    pub command_palette: String,
+    pub quick_select: String,
 }
 
 impl Default for Config {
@@ -130,6 +139,8 @@ impl Default for Config {
             cursor_style: "block".to_string(),
             cursor_blink: true,
             opacity: 1.0,
+            background_image: String::new(),
+            background_image_opacity: 0.25,
             backdrop: "none".to_string(),
             bell: "visual".to_string(),
             copy_on_select: false,
@@ -175,6 +186,10 @@ impl Default for Keybindings {
             fullscreen: "f11".to_string(),
             next_color_scheme: "ctrl+shift+n".to_string(),
             open_settings: "ctrl+,".to_string(),
+            previous_prompt: "ctrl+shift+up".to_string(),
+            next_prompt: "ctrl+shift+down".to_string(),
+            command_palette: "ctrl+shift+p".to_string(),
+            quick_select: "ctrl+shift+space".to_string(),
         }
     }
 }
@@ -211,8 +226,9 @@ impl PromptParts {
     pub fn cmd(&self) -> String {
         // $ starts a code in PROMPT; $$ is a literal one.
         let lit = |s: &str| s.replace('$', "$$");
-        // Always report the directory (OSC 9;9) so new tabs open there.
-        let mut out = String::from("$E]9;9;$P$E\\");
+        // Mark the prompt (OSC 133;A) for jumping between commands, and
+        // report the directory (OSC 9;9) so new tabs open there.
+        let mut out = String::from("$E]133;A$E\\$E]9;9;$P$E\\");
         if !self.name.is_empty() {
             out += &format!("$E[1;35m{}$E[0m ", lit(&self.name));
         }
@@ -230,7 +246,7 @@ impl PromptParts {
     pub fn powershell(&self) -> String {
         // Single-quoted strings take everything literally but '.
         let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
-        let mut parts = vec!["\"$e]9;9;$p$e\\\"".to_string()];
+        let mut parts = vec!["\"$e]133;A$e\\$e]9;9;$p$e\\\"".to_string()];
         if !self.name.is_empty() {
             parts.push(format!("\"$e[1;35m\" + {} + \"$e[0m \"", lit(&self.name)));
         }
@@ -359,18 +375,26 @@ pub fn available_shells() -> Vec<ShellChoice> {
             setting: "wsl.exe ~",
         });
     }
-    // tacoshell, the companion shell, when it's beside tacoterm.exe (where
-    // the build puts it, and where Windows looks first) or on PATH.
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.join("tacoshell.exe")));
-    if find_program("tacoshell.exe", beside).is_some() {
+    if let Some(setting) = tacoshell_setting() {
         out.push(ShellChoice {
             label: "tacoshell",
-            setting: "tacoshell.exe",
+            setting,
         });
     }
     out
+}
+
+/// The `shell =` setting for tacoshell when the installer put it beside
+/// tacoterm.exe.
+fn tacoshell_setting() -> Option<&'static str> {
+    static SETTING: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SETTING
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let shell = exe.with_file_name("tacoshell.exe");
+            shell.is_file().then(|| quote(&shell))
+        })
+        .as_deref()
 }
 
 /// Encode a PowerShell script for `-EncodedCommand` (base64 of UTF-16LE),
@@ -581,9 +605,32 @@ impl Config {
         }
     }
 
+    /// Where `background_image` points, with `~` expanded; None when unset.
+    pub fn background_image_path(&self) -> Option<PathBuf> {
+        let path = self.background_image.trim().trim_matches('"');
+        if path.is_empty() {
+            return None;
+        }
+        match path.strip_prefix('~') {
+            Some(rest) => {
+                let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+                Some(PathBuf::from(home).join(rest.trim_start_matches(['/', '\\'])))
+            }
+            None => Some(PathBuf::from(path)),
+        }
+    }
+
     /// Everything wrong with this config that parsing alone doesn't catch.
     pub fn warnings(&self) -> Vec<String> {
         let mut w = self.theme().1;
+        if let Some(path) = self.background_image_path() {
+            if !path.is_file() {
+                w.push(format!(
+                    "background_image \"{}\": no such file",
+                    self.background_image
+                ));
+            }
+        }
         if !(0.0..=1.0).contains(&self.opacity) {
             w.push(format!(
                 "opacity {}: use a number from 0.0 (clear) to 1.0 (solid)",
@@ -659,6 +706,10 @@ opacity = 1.0
 # Windows 11 material behind it: "none", "acrylic" (frosted glass),
 # "mica" or "tabbed". Pair acrylic with opacity = 0.6 or so.
 backdrop = "none"
+# A picture behind the text, e.g. "~/Pictures/wallpaper.jpg"; it covers
+# the window, faded to background_image_opacity.
+background_image = ""
+background_image_opacity = 0.25
 
 bell = "visual"             # visual, sound, both or none
 copy_on_select = false
@@ -732,6 +783,10 @@ zoom_reset = "ctrl+0"
 fullscreen = "f11"
 next_color_scheme = "ctrl+shift+n"
 open_settings = "ctrl+,"
+previous_prompt = "ctrl+shift+up"     # jump between commands (shell integration)
+next_prompt = "ctrl+shift+down"
+command_palette = "ctrl+shift+p"      # search every action
+quick_select = "ctrl+shift+space"     # label URLs, paths, hashes; type to copy
 "##;
 
 /// The first starter file pinned cmd.exe, which has no `clear`, `ls`… Move
@@ -957,7 +1012,7 @@ mod tests {
             cmd.shell_command(),
             (
                 "cmd.exe".to_string(),
-                vec![("PROMPT", ARROW_PROMPT.to_string())]
+                vec![("PROMPT", format!("$E]133;A$E\\{ARROW_PROMPT}"))]
             )
         );
         let classic = Config {
@@ -967,7 +1022,10 @@ mod tests {
         assert!(classic.shell_command().1.is_empty());
 
         // The default parts make the original arrow prompt.
-        assert_eq!(Config::default().prompt_parts().cmd(), ARROW_PROMPT);
+        assert_eq!(
+            Config::default().prompt_parts().cmd(),
+            format!("$E]133;A$E\\{ARROW_PROMPT}")
+        );
         let mine = Config {
             prompt_name: "LX $".into(),
             prompt_path: "none".into(),
@@ -978,7 +1036,7 @@ mod tests {
             mine.shell_command().1,
             vec![(
                 "PROMPT",
-                "$E]9;9;$P$E\\$E[1;35mLX $$$E[0m $E[32mλ$E[0m ".to_string()
+                "$E]133;A$E\\$E]9;9;$P$E\\$E[1;35mLX $$$E[0m $E[32mλ$E[0m ".to_string()
             )]
         );
         let bare = Config {

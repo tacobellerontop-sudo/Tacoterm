@@ -167,6 +167,10 @@ pub enum Action {
     Fullscreen,
     NextColorScheme,
     OpenSettings,
+    PreviousPrompt,
+    NextPrompt,
+    CommandPalette,
+    QuickSelect,
 }
 
 /// A parsed key combo such as `ctrl+shift+c`.
@@ -280,6 +284,10 @@ impl Bindings {
             (&kb.fullscreen, Action::Fullscreen),
             (&kb.next_color_scheme, Action::NextColorScheme),
             (&kb.open_settings, Action::OpenSettings),
+            (&kb.previous_prompt, Action::PreviousPrompt),
+            (&kb.next_prompt, Action::NextPrompt),
+            (&kb.command_palette, Action::CommandPalette),
+            (&kb.quick_select, Action::QuickSelect),
         ] {
             if combo.trim().is_empty() {
                 continue;

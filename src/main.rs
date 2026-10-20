@@ -18,6 +18,32 @@ mod win;
 
 #[cfg(windows)]
 fn main() {
+    // `tacoterm --cwd DIR` (or just `tacoterm DIR`, as Explorer's "Open in
+    // tacoterm" passes it) starts the shell there.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // `tacoterm --use-shell PATH` (the installer's "use tacoshell") saves
+    // PATH as the shell in config.toml and exits.
+    if args.first().is_some_and(|a| a == "--use-shell") {
+        let Some(path) = args.get(1).and_then(|p| p.to_str()) else {
+            std::process::exit(2);
+        };
+        let value = format!("'\"{}\"'", path.trim_matches('"'));
+        if let Err(e) = tacoterm::config::set_top_level("shell", &value) {
+            app::show_error(&format!("cannot save the shell: {e}"));
+            std::process::exit(1);
+        }
+        return;
+    }
+    let dir = match args.first().and_then(|a| a.to_str()) {
+        Some("--cwd") => args.get(1),
+        Some(_) => args.first(),
+        None => None,
+    };
+    if let Some(dir) = dir {
+        if let Err(e) = std::env::set_current_dir(dir) {
+            app::show_error(&format!("cannot open {}: {e}", dir.to_string_lossy()));
+        }
+    }
     if let Err(e) = app::run() {
         app::show_error(&e);
         std::process::exit(1);

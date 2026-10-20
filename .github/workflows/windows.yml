@@ -20,6 +20,8 @@ jobs:
         run: cargo build --release --locked --workspace
       - name: Bundle the console that passes pictures through
         run: ./scripts/get-conpty.ps1 -Dest target/release
+      - name: Build the installer
+        run: ./scripts/build-installer.ps1
       - name: Build the tacoshell installer
         shell: pwsh
         run: |
@@ -33,13 +35,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tacoshell-setup
-          path: target/installer/tacoshell-setup-*.exe
+          path: target/tacoshell-installer/tacoshell-setup-*.exe
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: tacoterm-windows-x86_64
           path: |
             target/release/tacoterm.exe
-            target/release/tacoshell.exe
             target/release/conpty.dll
             target/release/OpenConsole.exe
+            target/release/tacoshell.exe
+          if-no-files-found: warn
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: tacoterm-setup
+          path: target/installer/*.exe
+          if-no-files-found: error

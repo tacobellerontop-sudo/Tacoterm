@@ -1,6 +1,6 @@
 ; The tacoshell installer (Inno Setup 6). CI builds it with
 ;   iscc /DAppVersion=0.1.0 tacoshell\installer\tacoshell.iss
-; after `cargo build --release`, and it lands in target\installer.
+; after `cargo build --release`, and it lands in target\tacoshell-installer.
 ;
 ; It installs for the current user by default (no admin needed; the first
 ; page offers everyone instead), puts tacoshell on PATH so tacoterm and other
@@ -30,7 +30,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesEnvironment=yes
 LicenseFile=..\..\LICENSE
-OutputDir=..\..\target\installer
+OutputDir=..\..\target\tacoshell-installer
 OutputBaseFilename=tacoshell-setup-{#AppVersion}
 UninstallDisplayIcon={app}\tacoshell.exe
 UninstallDisplayName=tacoshell
