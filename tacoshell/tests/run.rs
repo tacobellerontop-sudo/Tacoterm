@@ -93,7 +93,7 @@ fn cd_and_scripts() {
     std::fs::create_dir_all(dir.join("sub dir")).unwrap();
     std::fs::write(
         dir.join("script.tsh"),
-        "# a comment\nalias greet='echo hi from'\ncd 'sub dir'\ngreet $X\nls ..\nexit 4\necho not reached\n",
+        "# a comment\nalias greet='echo hi from'\ncd 'sub dir'\ngreet $X\nls -1 ..\nexit 4\necho not reached\n",
     )
     .unwrap();
     let o = Command::new(TS)
@@ -121,7 +121,7 @@ fn builtins_read_pipes_and_files() {
         &dir,
         "echo cherry > f.txt; echo apple >> f.txt; echo banana >> f.txt; \
          cat f.txt | sort | head -n 2; grep -c an < f.txt; cat f.txt | grep -v e | wc -l; \
-         mkdir -p a/b && touch a/b/x && ls a/b && rm -r a && ls",
+         mkdir -p a/b && touch a/b/x && ls -1 a/b && rm -r a && ls -1",
     );
     assert_eq!(stdout(&o), "apple\nbanana\n1\n1\nx\nf.txt\n");
     std::fs::remove_dir_all(&dir).unwrap();

@@ -805,9 +805,10 @@ fn set_var(name: &str, value: &str) {
 
 fn ls(args: &[String], out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
     let all = args.iter().any(|a| a == "-a");
+    let names_only = args.iter().any(|a| a == "-1");
     let mut paths: Vec<&str> = args
         .iter()
-        .filter(|a| *a != "-a")
+        .filter(|a| *a != "-a" && *a != "-1")
         .map(String::as_str)
         .collect();
     if paths.is_empty() {
@@ -833,17 +834,93 @@ fn ls(args: &[String], out: &mut Vec<u8>, err: &mut Vec<u8>) -> i32 {
         if paths.len() > 1 {
             let _ = writeln!(out, "{}{path}:", if n > 0 { "\n" } else { "" });
         }
-        let mut names: Vec<String> = entries
+        let mut entries: Vec<std::fs::DirEntry> = entries
             .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| all || !name.starts_with('.'))
+            .filter(|e| all || !e.file_name().to_string_lossy().starts_with('.'))
             .collect();
-        names.sort_by_key(|name| name.to_lowercase());
-        for name in names {
-            let _ = writeln!(out, "{name}");
+        entries.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
+        if names_only {
+            for e in entries {
+                let _ = writeln!(out, "{}", e.file_name().to_string_lossy());
+            }
+            continue;
         }
+        let rows: Vec<[String; 3]> = entries
+            .iter()
+            .map(|e| {
+                let (kind, size) = match e.file_type() {
+                    Ok(t) if t.is_symlink() => ("LINK", 0),
+                    Ok(t) if t.is_dir() => ("FOLDER", folder_size(&e.path())),
+                    _ => ("FILE", e.metadata().map_or(0, |m| m.len())),
+                };
+                [
+                    kind.to_string(),
+                    e.file_name().to_string_lossy().into_owned(),
+                    human_size(size),
+                ]
+            })
+            .collect();
+        let _ = out.write_all(table(["TYPE", "NAME", "SIZE"], &rows).as_bytes());
     }
     status
+}
+
+/// Everything under a folder, added up. Links aren't followed, and what
+/// can't be read counts as nothing.
+fn folder_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_symlink() => 0,
+            Ok(t) if t.is_dir() => folder_size(&e.path()),
+            _ => e.metadata().map_or(0, |m| m.len()),
+        })
+        .sum()
+}
+
+/// `512 B`, `1.50 KB`, `2.12 TB` (1 KB = 1024 bytes, like Explorer).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+/// Columns padded to line up, split by ` | `; sizes are right-aligned.
+fn table(header: [&str; 3], rows: &[[String; 3]]) -> String {
+    let mut widths = header.map(crate::editor::str_width);
+    for row in rows {
+        for (w, cell) in widths.iter_mut().zip(row) {
+            *w = (*w).max(crate::editor::str_width(cell));
+        }
+    }
+    let line = |cells: [&str; 3]| {
+        let pad = |i: usize| " ".repeat(widths[i] - crate::editor::str_width(cells[i]));
+        format!(
+            "{}{} | {}{} | {}{}\n",
+            cells[0],
+            pad(0),
+            cells[1],
+            pad(1),
+            pad(2),
+            cells[2]
+        )
+    };
+    let mut s = line(header);
+    for row in rows {
+        s.push_str(&line([&row[0], &row[1], &row[2]]));
+    }
+    s
 }
 
 const HELP: &str = "\
@@ -860,7 +937,8 @@ tacoshell: a command shell for Windows
 
 Built-ins:
   cd [dir|-]   change folder (no dir: home; -: the previous one; D: works too)
-  ls [-a]      list a folder        pwd     show the current folder
+  ls [-a] [-1] list a folder: type, name, size (-1: names only)
+  pwd          show the current folder
   echo [-n]    print words          clear   clear the screen (or cls)
   set NAME=value  (or NAME=value)   unset NAME    env    list variables
   alias name='cmd args'   unalias name   which name   history [-c]
@@ -885,3 +963,41 @@ Keys: Tab completes, Up/Down history, Ctrl+Left/Right by word, Ctrl+W/U/K
 delete a word / to start / to end, Esc clears the line, Ctrl+L clears the
 screen, Ctrl+C cancels, Ctrl+D on an empty line exits.
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_read_like_explorer() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1536), "1.50 KB");
+        assert_eq!(human_size(2_330_000_000_000), "2.12 TB");
+    }
+
+    #[test]
+    fn lists_type_name_and_size() {
+        let dir = std::env::temp_dir().join(format!("tacoshell-ls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("weluvbanana/deep")).unwrap();
+        std::fs::write(dir.join("weluvbanana/deep/a.bin"), vec![0u8; 2048]).unwrap();
+        std::fs::write(dir.join("notes.txt"), "hello").unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(ls(&[dir.display().to_string()], &mut out, &mut err), 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "TYPE   | NAME        |    SIZE\n\
+             FILE   | notes.txt   |     5 B\n\
+             FOLDER | weluvbanana | 2.00 KB\n"
+        );
+        let mut out = Vec::new();
+        ls(
+            &["-1".into(), dir.display().to_string()],
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "notes.txt\nweluvbanana\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

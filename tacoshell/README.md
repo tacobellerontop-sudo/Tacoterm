@@ -22,7 +22,8 @@ settings page (or set `shell = "tacoshell.exe"` in `config.toml`).
 - Programs from PATH using PATHEXT (`.exe`, `.cmd`, `.bat`, …); `.ps1`
   scripts run through PowerShell; cmd's own commands (`dir`, `copy`, `del`,
   `type`, `mklink`, `start`, …) run through `cmd /c`
-- Built-ins: `cd` (`cd -`, `cd..`, `D:`), `pushd`/`popd`/`dirs`, `ls`,
+- Built-ins: `cd` (`cd -`, `cd..`, `D:`), `pushd`/`popd`/`dirs`, `ls` (a
+  TYPE | NAME | SIZE table with folder totals; `ls -1` for names only),
   `pwd`, `echo`, `set`, `export`, `unset`, `env`, `alias`, `unalias`,
   `which`, `history`, `clear`/`cls`, `source`, `help`, `exit`
 - The everyday Unix commands, built in so they're on every machine: `cat`,
