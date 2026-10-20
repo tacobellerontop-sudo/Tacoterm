@@ -715,6 +715,7 @@ impl App {
             }
             ShellKind::Cmd => "cmd.exe",
             _ if self.config.shell.to_lowercase().contains("wsl") => "wsl.exe ~",
+            _ if self.config.shell.to_lowercase().contains("tacoshell") => "tacoshell.exe",
             _ => "",
         };
         let state = menu::State {

@@ -13,15 +13,29 @@ jobs:
         with:
           components: clippy
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --workspace
       - name: Bundle the console that passes pictures through
         run: ./scripts/get-conpty.ps1 -Dest target/release
       - name: Build the installer
         run: ./scripts/build-installer.ps1
+      - name: Build the tacoshell installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $meta = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq tacoshell).version
+          & $iscc /Q "/DAppVersion=$version" tacoshell/installer/tacoshell.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload the tacoshell installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: tacoshell-setup
+          path: target/tacoshell-installer/tacoshell-setup-*.exe
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
